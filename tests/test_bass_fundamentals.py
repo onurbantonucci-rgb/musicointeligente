@@ -164,12 +164,12 @@ class TestBassFundamentals(unittest.TestCase):
         self.assertIsNone(bass.on_musical_context(context))
         self.assertEqual(bass.synthesizer.scheduled_events, [])
 
-    def test_chart_only_ignores_detected_chord_and_confirmed_variation(self):
+    def test_chart_only_uses_playalong_position_not_clock_or_detected_chord(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           harmony_source=BassHarmonySource.CHART)
-        context = self.context(timestamp=.25, beat=1, phase=.5, chord="G")
+        context = self.context(timestamp=.25, beat=1, phase=.5, chord="C")
         context.chart_available = True
-        context.chart_clock_chord = "C"
+        context.chart_clock_chord = "G"
         context.chart_next_clock_chord = "Am"
         context.clock_bar = 1
         context.clock_beat = 1
@@ -184,7 +184,7 @@ class TestBassFundamentals(unittest.TestCase):
         self.assertTrue(event.note.startswith("C"))
         self.assertEqual(bass.synthesizer.scheduled_events[0].source, "chart-only")
 
-    def test_chart_only_prepares_next_bar_from_chart_even_when_cursor_waits(self):
+    def test_chart_only_holds_playalong_chord_when_clock_enters_next_bar(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           note_value=BassNoteValue.HALF,
                           harmony_source=BassHarmonySource.CHART)
@@ -198,7 +198,36 @@ class TestBassFundamentals(unittest.TestCase):
         context.audio_activity = .1
         event = bass.on_musical_context(context)
         self.assertEqual((event.bar, event.beat), (2, 1))
-        self.assertTrue(event.note.startswith("A"))
+        self.assertTrue(event.note.startswith("C"))
+
+    def test_chart_only_replaces_pending_note_when_playalong_position_changes(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.75, beat=2, phase=.5, chord="C")
+        context.chart_available = True
+        context.clock_bar = 1
+        context.clock_beat = 2
+        bass.on_musical_context(context)
+        self.assertEqual(bass.synthesizer.scheduled_events[0].note, "C2")
+        context.chord = "G"
+        context.timestamp = .77
+        context.beat_position = .54
+        bass.on_musical_context(context)
+        self.assertEqual(len(bass.synthesizer.scheduled_events), 1)
+        self.assertTrue(bass.synthesizer.scheduled_events[0].note.startswith("G"))
+
+    def test_chart_only_legacy_pattern_also_uses_playalong_chord(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.ROOT,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=1.75, beat=4, phase=.5, chord="C")
+        context.chart_available = True
+        context.clock_bar = 1
+        context.clock_beat = 4
+        context.chart_next_clock_chord = "G"
+        event = bass.on_musical_context(context)
+        self.assertEqual((event.bar, event.beat), (2, 1))
+        self.assertTrue(event.note.startswith("C"))
 
     def test_short_scheduling_lead_does_not_skip_nearby_beat(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,

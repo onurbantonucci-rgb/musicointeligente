@@ -57,6 +57,7 @@ class BassPlayer(VirtualInstrument):
         self._last_chord: str = "--"
         self._last_scheduled_time: Optional[float] = None
         self._generation_id: Optional[int] = None
+        self._last_chart_position_chord: str = "--"
 
         # Histórico recente para modo debug e UI (ring-buffer)
         self._recent_events: collections.deque = collections.deque(maxlen=30)
@@ -124,6 +125,7 @@ class BassPlayer(VirtualInstrument):
         self._synthesizer.set_generation(context.position_generation)
         self._generation_id = context.position_generation
         self._last_triggered_beat = None
+        self._last_chart_position_chord = context.chord
         return self._schedule_root_grid(context, allow_current=True)
 
     @property
@@ -136,6 +138,7 @@ class BassPlayer(VirtualInstrument):
         self._synthesizer.cancel_scheduled()
         self._synthesizer.stop_voices()
         self._last_triggered_beat = None
+        self._last_chart_position_chord = "--"
 
     @property
     def volume(self) -> float:
@@ -224,6 +227,7 @@ class BassPlayer(VirtualInstrument):
         self._last_chord = "--"
         self._last_scheduled_time = None
         self._generation_id = None
+        self._last_chart_position_chord = "--"
         self._last_context = None
         self._recent_events.clear()
 
@@ -267,6 +271,14 @@ class BassPlayer(VirtualInstrument):
         if not self._enabled:
             return None
 
+        if self._harmony_source == BassHarmonySource.CHART:
+            # O Play Along já publicou a posição da cifra localizada pelo áudio.
+            # O relógio fornece o instante, mas nunca escolhe outro acorde.
+            if context.chord != self._last_chart_position_chord:
+                self._synthesizer.cancel_scheduled()
+                self._last_chart_position_chord = context.chord
+            if not context.chart_available:
+                return None
         self._last_context = context
         performance_state = getattr(context, "performance_state", "PLAYING")
         if performance_state in ("HOLDING", "WAITING", "ENDED"):
@@ -282,8 +294,7 @@ class BassPlayer(VirtualInstrument):
                 context.position_confidence < 0.65):
             self._synthesizer.cancel_scheduled()
             return None
-        active_chord = (context.chart_clock_chord if self._harmony_source == BassHarmonySource.CHART
-                        else context.chord)
+        active_chord = context.chord
         if (active_chord == "--" or
                 not ChartSemanticClassifier.is_chord_shaped(active_chord)):
             self._synthesizer.cancel_scheduled()
@@ -407,8 +418,7 @@ class BassPlayer(VirtualInstrument):
             beat = 1
         key = (bar, beat)
         if chart_only:
-            next_chord = (context.chart_next_clock_chord if bar > context.clock_bar
-                          else context.chart_clock_chord)
+            next_chord = context.chord
             source = "chart-only"
             if (next_chord == "--" or
                     not ChartSemanticClassifier.is_chord_shaped(next_chord)):
@@ -560,8 +570,7 @@ class BassPlayer(VirtualInstrument):
                 return None
 
         if chart_only:
-            target_chord = (context.chart_next_clock_chord if target_bar > clock_bar
-                            else context.chart_clock_chord)
+            target_chord = context.chord
             if (target_chord == "--" or
                     not ChartSemanticClassifier.is_chord_shaped(target_chord)):
                 self._synthesizer.cancel_scheduled()
