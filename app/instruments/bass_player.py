@@ -280,8 +280,12 @@ class BassPlayer(VirtualInstrument):
             # O Play Along já publicou a posição da cifra localizada pelo áudio.
             # O relógio fornece o instante, mas nunca escolhe outro acorde.
             if context.chord != self._last_chart_position_chord:
-                previous_root = parse_chord(self._last_chart_position_chord).root
-                next_root = parse_chord(context.chord).root
+                previous_root = (parse_chord(self._last_chart_position_chord).root
+                                 if ChartSemanticClassifier.is_chord_shaped(
+                                     self._last_chart_position_chord) else "--")
+                next_root = (parse_chord(context.chord).root
+                             if ChartSemanticClassifier.is_chord_shaped(context.chord)
+                             else "--")
                 chart_chord_changed = (previous_root not in ("", "--") and
                                        next_root not in ("", "--") and
                                        previous_root != next_root)
@@ -607,6 +611,36 @@ class BassPlayer(VirtualInstrument):
                     not ChartSemanticClassifier.is_chord_shaped(target_chord)):
                 self._synthesizer.cancel_scheduled()
                 return None
+            if not chord_change:
+                current_root = parse_chord(target_chord).root
+                next_root = (parse_chord(context.next_expected_chord).root
+                             if ChartSemanticClassifier.is_chord_shaped(
+                                 context.next_expected_chord) else "--")
+                projected_chart_bar = context.bar + max(0, target_bar - clock_bar)
+                next_bar_reached = (context.next_change_bar > 0 and
+                                    projected_chart_bar >= context.next_change_bar)
+                clock_on_next = (ChartSemanticClassifier.is_chord_shaped(
+                    context.chart_clock_chord) and
+                    parse_chord(context.chart_clock_chord).root == next_root)
+                candidate_on_next = (ChartSemanticClassifier.is_chord_shaped(
+                    context.chord_candidate) and
+                    parse_chord(context.chord_candidate).root == next_root and
+                    context.chord_candidate_confidence >= .60)
+                stable_disagrees = (
+                    context.audio_activity >= .005 and
+                    context.stable_chord_confidence >= .70 and
+                    (context.stable_chord_duration >= .15 or
+                     context.stable_chord_confidence >= .80) and
+                    ChartSemanticClassifier.is_chord_shaped(context.smoothed_detected_chord) and
+                    parse_chord(context.smoothed_detected_chord).root != current_root)
+                if (next_root not in ("", "--") and next_root != current_root and
+                        (next_bar_reached or candidate_on_next or
+                         (clock_on_next and stable_disagrees))):
+                    # A cifra prevê outra fundamental neste pulso, mas o cursor
+                    # do Play Along ainda aguarda confirmação. Não atacar a
+                    # tônica antiga logo antes da nova; esperar a confirmação.
+                    self._synthesizer.cancel_scheduled(key)
+                    return None
             source = "chart-only"
         else:
             selected = self._choose_follow_chord(context, clock_bar, target_bar)

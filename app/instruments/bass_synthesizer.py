@@ -183,10 +183,13 @@ class BassSynthesizer:
                 self._rendered_beats.clear()
                 self._generation_id = generation_id
 
-    def cancel_scheduled(self) -> None:
-        """Cancela ataques futuros sem interromper a nota que já está soando."""
+    def cancel_scheduled(self, key: Optional[tuple] = None) -> None:
+        """Cancela ataques futuros, ou só o pulso indicado, sem cortar a voz atual."""
         with self._lock:
-            self._scheduled.clear()
+            if key is None:
+                self._scheduled.clear()
+            else:
+                self._scheduled.pop(key, None)
 
     def stop_voices(self) -> None:
         """Encerra vozes ativas ao trocar para um padrão de uma nota por vez."""

@@ -305,6 +305,127 @@ class TestBassFundamentals(unittest.TestCase):
         bass.synthesizer.render_chunk(46, 1000, .596)
         self.assertTrue(bass.synthesizer.playing_event.note.startswith("G"))
 
+    def test_chart_transition_cancels_old_root_before_confirmed_new_root(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.65, beat=1, phase=.3, chord="B")
+        context.chart_available = True
+        context.clock_bar = 2
+        context.clock_beat = 1
+        context.chart_clock_chord = "B"
+        old = bass.on_musical_context(context)
+        self.assertTrue(old.note.startswith("B"))
+        self.assertEqual(len(bass.synthesizer.scheduled_events), 1)
+
+        # O relógio alcança o sucessor antes que o áudio confirme o cursor.
+        context.timestamp = .9
+        context.beat_position = .8
+        context.next_expected_chord = "F#"
+        context.next_change_bar = 2
+        context.chart_clock_chord = "F#"
+        context.chord_candidate = "F#"
+        context.chord_candidate_confidence = .7
+        self.assertIsNone(bass.on_musical_context(context))
+        self.assertEqual(bass.synthesizer.scheduled_events, [])
+        bass.synthesizer.render_chunk(100, 1000, .95)
+        self.assertIsNone(bass.synthesizer.playing_event)
+
+        context.chord = "F#"
+        context.timestamp = 1.05
+        context.clock_beat = 2
+        context.beat_position = .1
+        new = bass.on_musical_context(context)
+        self.assertTrue(new.note.startswith("F#"))
+        context.next_expected_chord = "G"
+        context.chart_clock_chord = "G"
+        context.chord_candidate = "G"
+        context.timestamp = 1.06
+        context.beat_position = .12
+        self.assertIsNone(bass.on_musical_context(context))
+        self.assertEqual(len(bass.synthesizer.scheduled_events), 1)
+        bass.synthesizer.render_chunk(100, 1000, 1.05)
+        self.assertTrue(bass.synthesizer.playing_event.note.startswith("F#"))
+
+    def test_chart_transition_bar_blocks_old_root_without_clock_chord_hint(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=1.9, beat=4, phase=.8, chord="B")
+        context.chart_available = True
+        context.bar = 7
+        context.clock_bar = 11
+        context.clock_beat = 4
+        context.next_expected_chord = "D#m"
+        context.next_change_bar = 8
+        context.chart_clock_chord = "C#"
+        self.assertIsNone(bass.on_musical_context(context))
+        self.assertEqual(bass.synthesizer.scheduled_events, [])
+
+    def test_first_chart_chord_is_not_a_change_from_missing_chord(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.75, beat=2, phase=.5, chord="G")
+        context.chart_available = True
+        context.clock_bar = 1
+        context.clock_beat = 2
+        event = bass.on_musical_context(context)
+        self.assertEqual((event.bar, event.beat), (1, 3))
+        self.assertAlmostEqual(event.start_time, 1.0)
+
+    def test_clock_hint_alone_does_not_silence_confirmed_current_root(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.75, beat=2, phase=.5, chord="B")
+        context.chart_available = True
+        context.clock_bar = 2
+        context.clock_beat = 2
+        context.next_expected_chord = "F#"
+        context.next_change_bar = 2
+        context.chart_clock_chord = "F#"
+        context.smoothed_detected_chord = "B"
+        context.stable_chord_confidence = .9
+        context.stable_chord_duration = .4
+        context.audio_activity = .1
+        event = bass.on_musical_context(context)
+        self.assertTrue(event.note.startswith("B"))
+
+    def test_clock_hint_and_stable_audio_disagreement_hold_old_root(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.75, beat=2, phase=.5, chord="B")
+        context.chart_available = True
+        context.clock_bar = 2
+        context.clock_beat = 2
+        context.next_expected_chord = "F#"
+        context.next_change_bar = 2
+        context.chart_clock_chord = "F#"
+        context.smoothed_detected_chord = "G#m"
+        context.stable_chord_confidence = .8
+        context.stable_chord_duration = .3
+        context.audio_activity = .1
+        self.assertIsNone(bass.on_musical_context(context))
+        self.assertEqual(bass.synthesizer.scheduled_events, [])
+
+    def test_next_chart_chord_candidate_holds_old_root_before_cursor_moves(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.75, beat=2, phase=.5, chord="B")
+        context.chart_available = True
+        context.clock_bar = 2
+        context.clock_beat = 2
+        context.next_expected_chord = "F#"
+        context.next_change_bar = 2
+        context.chart_clock_chord = "B"
+        context.chord_candidate = "F#"
+        context.chord_candidate_confidence = .65
+        self.assertIsNone(bass.on_musical_context(context))
+        self.assertEqual(bass.synthesizer.scheduled_events, [])
+
     def test_chart_only_legacy_pattern_also_uses_playalong_chord(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.ROOT,
                           harmony_source=BassHarmonySource.CHART)
