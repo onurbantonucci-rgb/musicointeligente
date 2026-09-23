@@ -29,6 +29,12 @@ class BassNoteValue(Enum):
         return float(self.value)
 
 
+class BassHarmonySource(Enum):
+    """Fonte harmônica da nota; o relógio continua responsável pelo ataque."""
+    FOLLOW = "FOLLOW"
+    CHART = "CHART"
+
+
 @dataclass
 class BassNoteEvent:
     """Evento discreto de nota executada pelo Baixista Virtual."""

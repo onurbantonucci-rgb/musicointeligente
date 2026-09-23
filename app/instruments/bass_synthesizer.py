@@ -9,11 +9,13 @@ Responsável por sintetizar som de contrabaixo elétrico puro e quente em tempo 
 """
 
 import threading
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional
 import numpy as np
 
 from app.music.theory import midi_to_hz
+from app.instruments.bass_decision import midi_to_note_name
 from app.music.constants import BASS_DEFAULT_VOLUME
 
 
@@ -115,6 +117,9 @@ class BassSynthesizer:
         self._voices: List[ActiveVoice] = []
         self._scheduled = {}  # chave (compasso, beat) -> (timestamp, midi, velocidade, duração)
         self._generation_id = 0
+        self._rendered_beats = deque(maxlen=64)
+        self._playing_event: Optional[ScheduledBassNote] = None
+        self._last_render_delay_ms = 0.0
 
     @property
     def volume(self) -> float:
@@ -137,6 +142,7 @@ class BassSynthesizer:
             self._sample_rate = sr
             self._voices.clear()
             self._scheduled.clear()
+            self._playing_event = None
 
     def clear(self) -> None:
         """Interrompe todas as vozes ativas."""
@@ -144,17 +150,37 @@ class BassSynthesizer:
             self._voices.clear()
             self._scheduled.clear()
             self._generation_id = 0
+            self._rendered_beats.clear()
+            self._playing_event = None
+            self._last_render_delay_ms = 0.0
+
+    @property
+    def playing_event(self) -> Optional[ScheduledBassNote]:
+        """Último ataque que realmente entrou no buffer de áudio e ainda soa."""
+        with self._lock:
+            return self._playing_event if self._voices else None
+
+    @property
+    def last_render_delay_ms(self) -> float:
+        with self._lock:
+            return self._last_render_delay_ms
 
     @property
     def scheduled_events(self) -> List[ScheduledBassNote]:
         with self._lock:
             return sorted(self._scheduled.values(), key=lambda event: event.scheduled_time)
 
+    def was_rendered(self, beat_key: tuple) -> bool:
+        """Distingue uma previsão cancelada de uma batida que já soou."""
+        with self._lock:
+            return beat_key in self._rendered_beats
+
     def set_generation(self, generation_id: int) -> None:
         """Invalida a projeção antiga sem cortar notas que já estão soando."""
         with self._lock:
             if generation_id > self._generation_id:
                 self._scheduled.clear()
+                self._rendered_beats.clear()
                 self._generation_id = generation_id
 
     def cancel_scheduled(self) -> None:
@@ -166,6 +192,7 @@ class BassSynthesizer:
         """Encerra vozes ativas ao trocar para um padrão de uma nota por vez."""
         with self._lock:
             self._voices.clear()
+            self._playing_event = None
 
     def schedule_note(self, key: tuple, start_time: float, midi_note: int,
                       velocity: int, duration: float, source: str = "chart",
@@ -175,7 +202,7 @@ class BassSynthesizer:
         if not self._enabled or midi_note <= 0:
             return
         with self._lock:
-            if generation_id != self._generation_id:
+            if generation_id != self._generation_id or key in self._rendered_beats:
                 return
             self._scheduled[key] = ScheduledBassNote(
                 key, start_time, midi_note, velocity, duration,
@@ -208,6 +235,10 @@ class BassSynthesizer:
             elif len(self._voices) >= 2:
                 self._voices = self._voices[-1:]
             self._voices.append(voice)
+            self._playing_event = ScheduledBassNote(
+                (), 0.0, midi_note, velocity, duration, "immediate", 1.0,
+                self._generation_id, midi_to_note_name(midi_note))
+            self._last_render_delay_ms = 0.0
 
     def render_chunk(self, frames: int, sample_rate: int, current_pos: float = 0.0) -> np.ndarray:
         """Gera um bloco de áudio estéreo (frames, 2) pronto para mixagem no AudioPlayer."""
@@ -229,7 +260,7 @@ class BassSynthesizer:
                 cursor = 0
                 for key, event in due:
                     del self._scheduled[key]
-                    if event.scheduled_time < current_pos - .035:
+                    if event.scheduled_time < current_pos - .015:
                         continue
                     offset = max(0, round((event.scheduled_time - current_pos) * sample_rate))
                     if offset >= frames:
@@ -244,11 +275,17 @@ class BassSynthesizer:
                         mono_mix[cursor:offset] += segment
                     voices = [ActiveVoice(midi_to_hz(event.midi_note), event.velocity,
                                           event.duration, sample_rate)]
+                    self._rendered_beats.append(key)
+                    self._playing_event = event
+                    self._last_render_delay_ms = max(
+                        0.0, (current_pos - event.scheduled_time) * 1000.0)
                     cursor = offset
                 if cursor < frames:
                     for voice in voices:
                         mono_mix[cursor:] += voice.render(frames - cursor)
                 self._voices = [voice for voice in voices if not voice.is_finished]
+                if not self._voices:
+                    self._playing_event = None
             else:
                 active_voices = []
                 for voice in self._voices:
@@ -265,16 +302,22 @@ class BassSynthesizer:
                         start, midi, velocity, duration = (event.scheduled_time, event.midi_note,
                                                            event.velocity, event.duration)
                         # Evento vencido não entra no bloco e nunca é disparado em rajada.
-                        if start < current_pos - 0.035:
+                        if start < current_pos - 0.015:
                             continue
                         offset = max(0, round((start - current_pos) * sample_rate))
                         if offset >= frames:
                             continue
                         voice = ActiveVoice(midi_to_hz(midi), velocity, duration, sample_rate)
+                        self._rendered_beats.append(key)
                         mono_mix[offset:] += voice.render(frames - offset)
+                        self._playing_event = event
+                        self._last_render_delay_ms = max(
+                            0.0, (current_pos - event.scheduled_time) * 1000.0)
                         if not voice.is_finished:
                             active_voices.append(voice)
                 self._voices = active_voices
+                if not self._voices:
+                    self._playing_event = None
 
         # Aplica volume master do baixo com proteção estrita contra saturação/clipping
         mono_mix = np.clip(mono_mix * self._volume, -1.0, 1.0)

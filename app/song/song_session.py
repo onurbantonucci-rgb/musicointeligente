@@ -553,6 +553,13 @@ class SongSession:
         ctx.next_expected_section = position.next_section_name
         ctx.position_generation = self._position_generation
         ctx.chart_available = bool(self._chart.sections and position.current_chord != "--")
+        if self._alignment.event_count:
+            chart_bar = max(1, self.clock_bar - self._position_estimator.bar_offset)
+            ctx.chart_clock_chord = self._alignment.get_position_at(chart_bar).current_chord
+            ctx.chart_next_clock_chord = self._alignment.get_position_at(chart_bar + 1).current_chord
+        else:
+            ctx.chart_clock_chord = "--"
+            ctx.chart_next_clock_chord = "--"
         ctx.chart_alignment_confidence = self._chart_alignment_confidence if ctx.chart_available else 0.0
         ctx.performance_state = self.performance_state
         ctx.confirmed_variation_chord = (detected_chord if state.confirmed_variation

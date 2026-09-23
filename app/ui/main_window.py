@@ -29,7 +29,7 @@ from app.ui.chroma_view import ChromaView
 from app.ui.edit_history import ChartEditState, EditHistory
 from app.utils.audio_generator import generate_test_song, generate_acoustic_guitar_sample
 from app.utils.timing import LatencyTracker
-from app.instruments import BassPatternType, BassNoteValue
+from app.instruments import BassPatternType, BassNoteValue, BassHarmonySource
 from app.music.theory import midi_to_hz
 from app.project.project_manager import ProjectManager, DEFAULT_PROJECT_PATH
 from app.song.song import Song
@@ -75,6 +75,11 @@ class MainWindow:
         "Semicolcheia — 4x por tempo": BassNoteValue.SIXTEENTH,
     }
 
+    BASS_HARMONY_SOURCES = {
+        "Seguir sempre a cifra": BassHarmonySource.CHART,
+        "Cifra + confirmação do áudio": BassHarmonySource.FOLLOW,
+    }
+
     def __init__(self, root: tk.Tk, project_file_path: Optional[str] = None):
         self.root = root
         self.root.title("Virtual Band AI — Musician Play-Along & Banda Virtual (v0.4)")
@@ -87,6 +92,7 @@ class MainWindow:
         self.analyzer = AudioAnalyzer()
         self.analyzer.bass_player.pattern = BassPatternType.FUNDAMENTALS
         self.analyzer.bass_player.note_value = BassNoteValue.HALF
+        self.analyzer.bass_player.harmony_source = BassHarmonySource.CHART
         self._tempo_results = queue.SimpleQueue()
         self._audio_generation = 0
         self._high_res_active = False  # modo de alta resolução harmônica (ligado no play-along)
@@ -708,6 +714,14 @@ class MainWindow:
 
         rhythm_bar = tk.Frame(self.bass_container, bg="#181d26")
         rhythm_bar.pack(fill="x", pady=(0, 5))
+        tk.Label(rhythm_bar, text="Fonte das notas:", bg="#181d26", fg="#8c9ba5",
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 6))
+        self.combo_bass_harmony_source = ttk.Combobox(
+            rhythm_bar, values=list(self.BASS_HARMONY_SOURCES), state="readonly",
+            width=27, font=("Segoe UI", 8))
+        self.combo_bass_harmony_source.set("Seguir sempre a cifra")
+        self.combo_bass_harmony_source.pack(side="left", padx=(0, 12))
+        self.combo_bass_harmony_source.bind("<<ComboboxSelected>>", self._on_bass_harmony_source_changed)
         tk.Label(rhythm_bar, text="Repetição da tônica:", bg="#181d26", fg="#8c9ba5",
                  font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 6))
         self.combo_bass_note_value = ttk.Combobox(
@@ -729,7 +743,7 @@ class MainWindow:
         # Card 1: Nota Atual Tocada pelo Baixo
         c1 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
         c1.grid(row=0, column=0, sticky="nsew", padx=2)
-        tk.Label(c1, text="NOTA DO BAIXO", bg="#141820", fg="#00e676", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        tk.Label(c1, text="NOTA SOANDO DO BAIXO", bg="#141820", fg="#00e676", font=("Segoe UI", 7, "bold")).pack(anchor="w")
         self.lbl_bass_note = tk.Label(c1, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 18, "bold"))
         self.lbl_bass_note.pack()
         self.lbl_bass_freq = tk.Label(c1, text="MIDI --  |  -- Hz", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
@@ -738,7 +752,7 @@ class MainWindow:
         # Card 2: Motivo da Escolha (Fundamental, 5ª, 8ª, Inversão)
         c2 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
         c2.grid(row=0, column=1, sticky="nsew", padx=2)
-        tk.Label(c2, text="MOTIVO DA ESCOLHA", bg="#141820", fg="#00d2ff", font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        tk.Label(c2, text="ORIGEM / TEMPO", bg="#141820", fg="#00d2ff", font=("Segoe UI", 7, "bold")).pack(anchor="w")
         self.lbl_bass_reason = tk.Label(c2, text="Aguardando compasso...", bg="#141820", fg="#5a6677", font=("Segoe UI", 10, "bold"))
         self.lbl_bass_reason.pack(pady=2)
         self.lbl_bass_voice_leading = tk.Label(c2, text="Condução harmônica inteligente", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
@@ -1120,10 +1134,16 @@ class MainWindow:
             return
         session = self.project_manager.active_session
         if session is not None:
+            starting_from_zero = not session.is_paused and self.player.get_position() <= 0.01
             if session.is_paused:
                 session.resume()
             else:
                 session.start()
+            if starting_from_zero:
+                sr = self._current_source.get_sample_rate()
+                opening = self._current_source.get_chunk_at(0, min(4096, sr))
+                if opening.size and float(np.sqrt(np.mean(np.square(opening.astype(np.float64))))) >= .005:
+                    self.analyzer.bass_player.prepare_chart_start(session.context)
         self.player.play()
         self._update_transport_state(PlaybackState.PLAYING)
 
@@ -1354,21 +1374,34 @@ class MainWindow:
                     bass = self.analyzer.bass_player
                     cur_ev = bass.current_event
                     cur_dec = bass.current_decision
+                    playing = bass.synthesizer.playing_event
 
-                    if cur_ev is not None and bass.enabled:
-                        self.lbl_bass_note.config(text=cur_ev.note, fg="#00e676")
-                        freq = midi_to_hz(cur_ev.midi_note) if cur_ev.midi_note > 0 else 0.0
-                        self.lbl_bass_freq.config(text=f"MIDI {cur_ev.midi_note}  |  {freq:.1f} Hz  |  Vel: {cur_ev.velocity}")
-                        self.lbl_bass_reason.config(text=cur_ev.reason, fg="#ffffff")
+                    if bass.enabled:
                         pat_name = ("FUNDAMENTAIS" if bass.pattern == BassPatternType.FUNDAMENTALS else
                                     cur_dec.pattern_type.value.upper() if cur_dec else bass.pattern.value.upper())
                         self.lbl_bass_pattern_active.config(text=pat_name, fg="#00d2ff")
-                        self.lbl_bass_sub_pattern.config(
-                            text=f"{self.combo_bass_note_value.get()}  |  Comp. {cur_ev.bar}")
-
-                        pred_note, pred_timing = bass.get_prediction(current_bar=ctx.bar, current_beat=ctx.beat)
-                        self.lbl_bass_next_note.config(text=pred_note, fg="#ffd166")
-                        self.lbl_bass_next_timing.config(text=pred_timing, fg="#8c9ba5")
+                        self.lbl_bass_sub_pattern.config(text=self.combo_bass_note_value.get())
+                        if playing is not None:
+                            self.lbl_bass_note.config(text=playing.note, fg="#00e676")
+                            freq = midi_to_hz(playing.midi_note)
+                            self.lbl_bass_freq.config(
+                                text=f"MIDI {playing.midi_note}  |  {freq:.1f} Hz  |  Vel: {playing.velocity}")
+                            delay = bass.synthesizer.last_render_delay_ms
+                            self.lbl_bass_reason.config(
+                                text=f"Soando agora · {playing.source} · atraso {delay:.0f} ms",
+                                fg="#ffffff")
+                        else:
+                            self.lbl_bass_note.config(text="--", fg="#5a6677")
+                            self.lbl_bass_freq.config(text="Aguardando próximo ataque")
+                            self.lbl_bass_reason.config(text="Baixo em silêncio", fg="#8c9ba5")
+                        prepared = bass.synthesizer.scheduled_events
+                        if prepared:
+                            self.lbl_bass_next_note.config(text=prepared[0].note, fg="#ffd166")
+                            self.lbl_bass_next_timing.config(
+                                text=f"Agendada para {prepared[0].scheduled_time:.2f} s", fg="#8c9ba5")
+                        else:
+                            self.lbl_bass_next_note.config(text="--", fg="#5a6677")
+                            self.lbl_bass_next_timing.config(text="Aguardando próximo ataque", fg="#8c9ba5")
                     elif not bass.enabled:
                         self.lbl_bass_note.config(text="MUTED", fg="#ff5252")
                         self.lbl_bass_freq.config(text="Sintetizador desativado")
@@ -1584,6 +1617,11 @@ class MainWindow:
         label = self.combo_bass_note_value.get()
         self.analyzer.bass_player.note_value = self.BASS_NOTE_VALUES[label]
         self.lbl_status_msg.config(text=f"Repetição da tônica: {label}")
+
+    def _on_bass_harmony_source_changed(self, event=None) -> None:
+        label = self.combo_bass_harmony_source.get()
+        self.analyzer.bass_player.harmony_source = self.BASS_HARMONY_SOURCES[label]
+        self.lbl_status_msg.config(text=f"Fonte das notas do baixo: {label}")
 
     def _on_bass_volume_changed(self, val) -> None:
         try:

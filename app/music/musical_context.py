@@ -48,6 +48,8 @@ class MusicalContext:
     confirmed_variation_chord: str = "--"
     position_generation: int = 0               # Incrementado quando a projeção da cifra muda
     chart_available: bool = False
+    chart_clock_chord: str = "--"               # Cifra no compasso do relógio, após reancoragem
+    chart_next_clock_chord: str = "--"          # Cifra no próximo compasso do relógio
     performance_state: str = "PLAYING"         # Estado da banda, separado de tracking/clock
     current_chord: str = "--"                   # Alias de compatibilidade
     chord_root: str = "--"                      # Tônica do acorde (ex: "C")
@@ -223,6 +225,8 @@ class MusicalContext:
         self.confirmed_variation_chord = "--"
         self.position_generation = 0
         self.chart_available = False
+        self.chart_clock_chord = "--"
+        self.chart_next_clock_chord = "--"
         self.performance_state = "WAITING"
         self.current_chord = "--"
         self.chord_root = "--"
@@ -339,6 +343,8 @@ class MusicalContext:
                 "support_age_ms": round(self.current_chord_support_age_ms, 1),
                 "stale": self.stable_chord_stale,
                 "expected_chart_chord": self.expected_chart_chord,
+                "chart_clock_chord": self.chart_clock_chord,
+                "chart_next_clock_chord": self.chart_next_clock_chord,
                 "chart_prior_enabled": self.chart_prior_enabled,
             },
             "previous_chord": self.previous_chord,

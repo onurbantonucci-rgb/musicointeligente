@@ -16,7 +16,7 @@ import math
 import time
 
 from app.instruments.base import VirtualInstrument
-from app.instruments.bass_model import BassNoteEvent, BassDecision, BassPatternType, BassNoteValue
+from app.instruments.bass_model import BassNoteEvent, BassDecision, BassPatternType, BassNoteValue, BassHarmonySource
 from app.instruments.bass_decision import BassDecisionEngine
 from app.instruments.bass_pattern import BassPatternGenerator
 from app.instruments.bass_performance import BassPerformanceEngine
@@ -36,10 +36,12 @@ class BassPlayer(VirtualInstrument):
         volume: float = BASS_DEFAULT_VOLUME,
         pattern: BassPatternType = BassPatternType.AUTO,
         note_value: BassNoteValue = BassNoteValue.QUARTER,
+        harmony_source: BassHarmonySource = BassHarmonySource.FOLLOW,
     ):
         self._enabled: bool = True
         self._pattern_override: BassPatternType = pattern
         self._note_value = note_value
+        self._harmony_source = harmony_source
 
         # Módulos especializados com responsabilidades separadas
         self._decision_engine = BassDecisionEngine()
@@ -112,6 +114,27 @@ class BassPlayer(VirtualInstrument):
     def note_value(self, value: BassNoteValue) -> None:
         self._note_value = BassNoteValue(value)
         self._synthesizer.cancel_scheduled()
+        self._last_triggered_beat = None
+
+    def prepare_chart_start(self, context: MusicalContext) -> Optional[BassNoteEvent]:
+        """Arma o primeiro ataque antes que a reprodução comece em t=0."""
+        if (not self._enabled or self._harmony_source != BassHarmonySource.CHART or
+                not context.chart_available):
+            return None
+        self._synthesizer.set_generation(context.position_generation)
+        self._generation_id = context.position_generation
+        self._last_triggered_beat = None
+        return self._schedule_root_grid(context, allow_current=True)
+
+    @property
+    def harmony_source(self) -> BassHarmonySource:
+        return self._harmony_source
+
+    @harmony_source.setter
+    def harmony_source(self, value: BassHarmonySource) -> None:
+        self._harmony_source = BassHarmonySource(value)
+        self._synthesizer.cancel_scheduled()
+        self._synthesizer.stop_voices()
         self._last_triggered_beat = None
 
     @property
@@ -249,16 +272,20 @@ class BassPlayer(VirtualInstrument):
         if performance_state in ("HOLDING", "WAITING", "ENDED"):
             self._synthesizer.cancel_scheduled()
             return None
-        if getattr(context, "tracking_state", "TRACKING") in ("LOST", "RECOVERING"):
+        if (self._harmony_source != BassHarmonySource.CHART and
+                getattr(context, "tracking_state", "TRACKING") in ("LOST", "RECOVERING")):
             self._synthesizer.cancel_scheduled()
             return None
-        if (context.audio_activity >= 0.005 and
+        if (self._harmony_source != BassHarmonySource.CHART and
+                context.audio_activity >= 0.005 and
                 context.smoothed_detected_chord in ("", "--", "UNKNOWN", "N") and
                 context.position_confidence < 0.65):
             self._synthesizer.cancel_scheduled()
             return None
-        if (context.chord == "--" or
-                not ChartSemanticClassifier.is_chord_shaped(context.chord)):
+        active_chord = (context.chart_clock_chord if self._harmony_source == BassHarmonySource.CHART
+                        else context.chord)
+        if (active_chord == "--" or
+                not ChartSemanticClassifier.is_chord_shaped(active_chord)):
             self._synthesizer.cancel_scheduled()
             return None
         if context.tempo_tracking_state != "UNINITIALIZED":
@@ -279,7 +306,16 @@ class BassPlayer(VirtualInstrument):
         beat_dur = 60.0 / bpm
 
         # 1. Decisão harmônica
-        decision = self._decision_engine.decide(context, pattern_override=self._pattern_override)
+        decision_context = copy.copy(context) if active_chord != context.chord else context
+        decision_context.chord = active_chord
+        if decision_context is not context:
+            symbol = parse_chord(active_chord)
+            decision_context.chord_root = symbol.root
+            decision_context.chord_quality = symbol.quality
+            decision_context.bass_note = symbol.bass_note or symbol.root
+            decision_context.inversion = "slash" if symbol.bass_note and symbol.bass_note != symbol.root else "root"
+        decision = self._decision_engine.decide(
+            decision_context, pattern_override=self._pattern_override)
         self._current_decision = decision
 
         # 2. Padrão rítmico
@@ -352,7 +388,9 @@ class BassPlayer(VirtualInstrument):
         beat_duration = 60.0 / bpm
         beats = max(1, int(context.meter.split('/')[0]))
         phase = max(0.0, min(1.0, context.beat_position))
-        bar, beat = max(1, context.bar), max(1, context.beat)
+        chart_only = self._harmony_source == BassHarmonySource.CHART
+        bar = max(1, context.clock_bar if chart_only else context.bar)
+        beat = max(1, context.clock_beat if chart_only else context.beat)
         current_start = context.timestamp - phase * beat_duration
         if context.timestamp - current_start > 0.015:
             beat += 1
@@ -368,31 +406,40 @@ class BassPlayer(VirtualInstrument):
             bar += 1
             beat = 1
         key = (bar, beat)
-        chart_changes_here = (bar > context.bar and context.next_expected_chord != "--" and
-                              (context.next_change_bar == 0 or bar >= context.next_change_bar))
-        live_harmony_holds = (context.audio_activity >= 0.005 and
-                              context.harmonic_event_chord != context.next_expected_chord)
-        if live_harmony_holds:
-            chart_changes_here = False
-        next_chord = context.next_expected_chord if chart_changes_here else context.chord
-        source = "chart" if context.chart_available or context.next_expected_chord != "--" else "audio"
-        beats_to_target = max(0.0, (start_time - context.timestamp) / beat_duration)
-        rhythm_changes_here = (
-            context.rhythmic_next_chord != "--" and
-            context.duration_confidence >= 0.55 and context.pattern_confidence >= 0.55 and
-            context.beats_until_chord_change <= beats_to_target + 0.15)
-        if (context.audio_activity >= 0.005 and
-                context.harmonic_event_chord != context.rhythmic_next_chord):
-            rhythm_changes_here = False
-        if rhythm_changes_here:
-            next_chord = context.rhythmic_next_chord
-            source = "chart-pattern"
-        if (context.confirmed_variation_chord != "--" and
-                (bar == context.bar or
-                 (context.tracking_state in ("UNCERTAIN", "LOST") and
-                  context.position_confidence < 0.65))):
-            next_chord = context.confirmed_variation_chord
-            source = "audio-confirmed"
+        if chart_only:
+            next_chord = (context.chart_next_clock_chord if bar > context.clock_bar
+                          else context.chart_clock_chord)
+            source = "chart-only"
+            if (next_chord == "--" or
+                    not ChartSemanticClassifier.is_chord_shaped(next_chord)):
+                self._synthesizer.cancel_scheduled()
+                return None
+        else:
+            chart_changes_here = (bar > context.bar and context.next_expected_chord != "--" and
+                                  (context.next_change_bar == 0 or bar >= context.next_change_bar))
+            live_harmony_holds = (context.audio_activity >= 0.005 and
+                                  context.harmonic_event_chord != context.next_expected_chord)
+            if live_harmony_holds:
+                chart_changes_here = False
+            next_chord = context.next_expected_chord if chart_changes_here else context.chord
+            source = "chart" if context.chart_available or context.next_expected_chord != "--" else "audio"
+            beats_to_target = max(0.0, (start_time - context.timestamp) / beat_duration)
+            rhythm_changes_here = (
+                context.rhythmic_next_chord != "--" and
+                context.duration_confidence >= 0.55 and context.pattern_confidence >= 0.55 and
+                context.beats_until_chord_change <= beats_to_target + 0.15)
+            if (context.audio_activity >= 0.005 and
+                    context.harmonic_event_chord != context.rhythmic_next_chord):
+                rhythm_changes_here = False
+            if rhythm_changes_here:
+                next_chord = context.rhythmic_next_chord
+                source = "chart-pattern"
+            if (context.confirmed_variation_chord != "--" and
+                    (bar == context.bar or
+                     (context.tracking_state in ("UNCERTAIN", "LOST") and
+                      context.position_confidence < 0.65))):
+                next_chord = context.confirmed_variation_chord
+                source = "audio-confirmed"
         follow_level = getattr(context, "follow_confidence_level", "MEDIUM")
         # Baixa confiança mantém a banda presente, mas só em um ponto seguro e
         # sem preencher os tempos intermediários. Em média, AUTO evita notas de
@@ -409,6 +456,10 @@ class BassPlayer(VirtualInstrument):
             elif follow_level == "MEDIUM":
                 effective_pattern = BassPatternType.ROOT_FIFTH
         same_key = key == self._last_triggered_beat
+        # O callback remove o evento da fila ao renderizar. Uma correção de fase
+        # posterior não pode transformar o mesmo beat em um segundo ataque.
+        if same_key and self._synthesizer.was_rendered(key):
+            return None
         if (same_key and next_chord == self._last_chord and
                 self._last_scheduled_time is not None and
                 abs(start_time - self._last_scheduled_time) < 0.005):
@@ -466,7 +517,8 @@ class BassPlayer(VirtualInstrument):
         self._current_event = event
         return event
 
-    def _schedule_root_grid(self, context: MusicalContext) -> Optional[BassNoteEvent]:
+    def _schedule_root_grid(self, context: MusicalContext,
+                            allow_current: bool = False) -> Optional[BassNoteEvent]:
         """Agenda só a tônica na grade do relógio, com antecedência ao áudio de saída."""
         bpm = context.bpm if context.bpm > 0 else 120.0
         beat_duration = 60.0 / bpm
@@ -481,7 +533,8 @@ class BassPlayer(VirtualInstrument):
         interval = self._note_value.beats
         # Uma leitura que chegou em cima do ataque não gera nota atrasada.
         # O próximo ponto é preparado antes do callback de áudio alcançá-lo.
-        lead_beats = .06 / beat_duration
+        lead_beats = (-1e-9 if allow_current and current_grid <= 1e-9
+                      else .015 / beat_duration)
         grid_index = math.ceil((current_grid + lead_beats - 1e-9) / interval)
         target_grid = max(0.0, grid_index * interval)
         if context.performance_state == "RECOVERING":
@@ -493,7 +546,8 @@ class BassPlayer(VirtualInstrument):
         fraction = round(beat_in_bar - int(beat_in_bar), 6)
         key = ((target_bar, target_beat) if fraction == 0.0 else
                (target_bar, target_beat, round(fraction, 3)))
-        if (context.follow_confidence_level == "LOW" and
+        chart_only = self._harmony_source == BassHarmonySource.CHART
+        if (not chart_only and context.follow_confidence_level == "LOW" and
                 context.audio_activity >= .005 and
                 (target_beat != 1 or fraction != 0.0)):
             chart_root = parse_chord(context.chord).root
@@ -505,51 +559,23 @@ class BassPlayer(VirtualInstrument):
                 self._synthesizer.cancel_scheduled()
                 return None
 
-        target_chord = context.chord
-        source = "chart" if context.chart_available else "audio"
-        observed_root = context.harmonic_event_root
-        chart_root = parse_chord(context.chord).root
-        variation_root = parse_chord(context.confirmed_variation_chord).root
-        stable_root = parse_chord(context.smoothed_detected_chord).root
-        next_root = parse_chord(context.next_expected_chord).root
-        stable_audible = (context.audio_activity >= .005 and
-                          context.stable_chord_confidence >= .70 and
-                          context.stable_chord_duration >= .20 and
-                          stable_root not in ("", "--"))
-        audio_confirms_next = (stable_audible and
-                               context.next_expected_chord != "--" and
-                               stable_root == next_root)
-        if (stable_audible and stable_root not in (chart_root, variation_root) and
-                not audio_confirms_next):
-            self._synthesizer.cancel_scheduled()
-            return None
-        if (context.audio_activity >= .005 and
-                context.harmonic_event_confidence >= .65 and
-                context.current_chord_elapsed_beats >= .5 and
-                observed_root not in ("--", chart_root, variation_root, next_root)):
-            self._synthesizer.cancel_scheduled()
-            return None
-        chart_change = (target_bar > clock_bar and context.next_expected_chord != "--" and
-                        context.next_change_bar == context.bar + 1)
-        if chart_change and context.audio_activity >= .005:
-            current_root = parse_chord(context.chord).root
-            chart_change = (
-                context.follow_confidence_level == "HIGH" and
-                context.position_confidence >= .80 and
-                context.phase_confidence >= .45 and
-                context.stable_chord_confidence >= .60 and
-                context.harmonic_event_root == current_root
-            )
-        if chart_change:
-            target_chord = context.next_expected_chord
-        if audio_confirms_next:
-            target_chord = context.next_expected_chord
-            source = "audio-chart-confirmed"
-        if (context.confirmed_variation_chord != "--" and
-                context.position_confidence >= .65):
-            target_chord = context.confirmed_variation_chord
-            source = "audio-confirmed"
+        if chart_only:
+            target_chord = (context.chart_next_clock_chord if target_bar > clock_bar
+                            else context.chart_clock_chord)
+            if (target_chord == "--" or
+                    not ChartSemanticClassifier.is_chord_shaped(target_chord)):
+                self._synthesizer.cancel_scheduled()
+                return None
+            source = "chart-only"
+        else:
+            selected = self._choose_follow_chord(context, clock_bar, target_bar)
+            if selected is None:
+                self._synthesizer.cancel_scheduled()
+                return None
+            target_chord, source = selected
         same_key = key == self._last_triggered_beat
+        if same_key and self._synthesizer.was_rendered(key):
+            return None
         if (same_key and target_chord == self._last_chord and
                 self._last_scheduled_time is not None and
                 abs(start_time - self._last_scheduled_time) < .005):
@@ -573,7 +599,7 @@ class BassPlayer(VirtualInstrument):
             note=decision.root_note, midi_note=decision.root_midi,
             start_time=round(start_time, 4), duration=round(duration, 4),
             velocity=velocity, beat=target_beat, bar=target_bar,
-            confidence=decision.confidence, reason="Fundamental")
+            confidence=decision.confidence, reason="Fundamental da cifra" if chart_only else "Fundamental")
         self._last_triggered_beat = key
         self._last_chord = target_chord
         self._last_scheduled_time = start_time
@@ -590,3 +616,50 @@ class BassPlayer(VirtualInstrument):
         self._recent_events.append(event)
         self._current_event = event
         return event
+
+    def _choose_follow_chord(self, context: MusicalContext, clock_bar: int,
+                             target_bar: int) -> Optional[Tuple[str, str]]:
+        """Modo original: áudio pode confirmar/corrigir a harmonia prevista."""
+        target_chord = context.chord
+        source = "chart" if context.chart_available else "audio"
+        observed_root = context.harmonic_event_root
+        chart_root = parse_chord(context.chord).root
+        variation_root = parse_chord(context.confirmed_variation_chord).root
+        stable_root = parse_chord(context.smoothed_detected_chord).root
+        next_root = parse_chord(context.next_expected_chord).root
+        stable_audible = (context.audio_activity >= .005 and
+                          context.stable_chord_confidence >= .70 and
+                          context.stable_chord_duration >= .20 and
+                          stable_root not in ("", "--"))
+        audio_confirms_next = (stable_audible and
+                               context.next_expected_chord != "--" and
+                               stable_root == next_root)
+        if (stable_audible and stable_root not in (chart_root, variation_root) and
+                not audio_confirms_next):
+            return None
+        if (context.audio_activity >= .005 and
+                context.harmonic_event_confidence >= .65 and
+                context.current_chord_elapsed_beats >= .5 and
+                observed_root not in ("--", chart_root, variation_root, next_root)):
+            return None
+        chart_change = (target_bar > clock_bar and context.next_expected_chord != "--" and
+                        context.next_change_bar == context.bar + 1)
+        if chart_change and context.audio_activity >= .005:
+            current_root = parse_chord(context.chord).root
+            chart_change = (
+                context.follow_confidence_level == "HIGH" and
+                context.position_confidence >= .80 and
+                context.phase_confidence >= .45 and
+                context.stable_chord_confidence >= .60 and
+                context.harmonic_event_root == current_root
+            )
+        if chart_change:
+            target_chord = context.next_expected_chord
+        if audio_confirms_next:
+            target_chord = context.next_expected_chord
+            source = "audio-chart-confirmed"
+        if (context.confirmed_variation_chord != "--" and
+                context.position_confidence >= .65):
+            target_chord = context.confirmed_variation_chord
+            source = "audio-confirmed"
+        return target_chord, source
