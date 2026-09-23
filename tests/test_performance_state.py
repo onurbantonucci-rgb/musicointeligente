@@ -66,6 +66,15 @@ class TestPerformanceState(unittest.TestCase):
         self.assertEqual(session.performance_state, PerformanceState.UNCERTAIN.value)
         self.assertEqual(session.current_section, "Intro")
 
+    def test_activity_after_brief_gap_resumes_playing_without_downbeat_wait(self):
+        session = self.session()
+        self.make_playing(session)
+        session.update_audio_tick(2.4, source_context=self.source())
+        self.assertEqual(session.performance_state, PerformanceState.UNCERTAIN.value)
+        session.update_audio_tick(2.5, detected_chord="G", detected_confidence=.9,
+                                  source_context=self.source(.1))
+        self.assertEqual(session.performance_state, PerformanceState.PLAYING.value)
+
     def test_long_pause_holds_position_and_waits_in_middle_without_ending(self):
         session = self.session()
         self.make_playing(session)

@@ -120,6 +120,7 @@ class BassSynthesizer:
         self._rendered_beats = deque(maxlen=64)
         self._playing_event: Optional[ScheduledBassNote] = None
         self._last_render_delay_ms = 0.0
+        self._rendered_until_time: Optional[float] = None
 
     @property
     def volume(self) -> float:
@@ -143,6 +144,7 @@ class BassSynthesizer:
             self._voices.clear()
             self._scheduled.clear()
             self._playing_event = None
+            self._rendered_until_time = None
 
     def clear(self) -> None:
         """Interrompe todas as vozes ativas."""
@@ -153,6 +155,7 @@ class BassSynthesizer:
             self._rendered_beats.clear()
             self._playing_event = None
             self._last_render_delay_ms = 0.0
+            self._rendered_until_time = None
 
     @property
     def playing_event(self) -> Optional[ScheduledBassNote]:
@@ -164,6 +167,12 @@ class BassSynthesizer:
     def last_render_delay_ms(self) -> float:
         with self._lock:
             return self._last_render_delay_ms
+
+    @property
+    def rendered_until_time(self) -> Optional[float]:
+        """Fim do último buffer que já foi entregue à saída de áudio."""
+        with self._lock:
+            return self._rendered_until_time
 
     @property
     def scheduled_events(self) -> List[ScheduledBassNote]:
@@ -321,6 +330,7 @@ class BassSynthesizer:
                 self._voices = active_voices
                 if not self._voices:
                     self._playing_event = None
+            self._rendered_until_time = current_pos + frames / sample_rate
 
         # Aplica volume master do baixo com proteção estrita contra saturação/clipping
         mono_mix = np.clip(mono_mix * self._volume, -1.0, 1.0)

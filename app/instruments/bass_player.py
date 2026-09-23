@@ -565,11 +565,17 @@ class BassPlayer(VirtualInstrument):
             # Troca harmônica é um novo ataque, mesmo entre os pulsos 1/3 da
             # mínima. A grade seguinte passa a contar da batida dessa troca.
             self._chart_rhythm_anchor_grid = math.floor(current_grid)
-            # A análise pode terminar depois que o callback já gerou o buffer
-            # atual. Deixar um buffer conhecido à frente evita perder a troca.
-            output_horizon = max(0.0, context.output_latency) / 1000.0
-            delay = max(.020, output_horizon + .010)
-            start_time = context.timestamp + delay
+            # A UI pode terminar a análise depois de um ou mais callbacks de
+            # áudio. O fim do buffer realmente renderizado é o limite seguro;
+            # agendar pelo timestamp antigo perderia a nota e esperaria outro beat.
+            rendered_until = self._synthesizer.rendered_until_time
+            if (rendered_until is not None and
+                    abs(rendered_until - context.timestamp) <= max(1.0, 2 * beat_duration)):
+                start_time = max(context.timestamp + .020, rendered_until + .010)
+            else:
+                output_horizon = max(0.0, context.output_latency) / 1000.0
+                start_time = context.timestamp + max(.020, output_horizon + .010)
+            delay = start_time - context.timestamp
             target_grid = current_grid + delay / beat_duration
             target_bar = int(target_grid // beats_per_bar) + 1
             beat_in_bar = target_grid % beats_per_bar

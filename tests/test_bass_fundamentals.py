@@ -305,6 +305,32 @@ class TestBassFundamentals(unittest.TestCase):
         bass.synthesizer.render_chunk(46, 1000, .596)
         self.assertTrue(bass.synthesizer.playing_event.note.startswith("G"))
 
+    def test_late_analysis_schedules_new_chart_root_after_rendered_audio(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.25, beat=1, phase=.5, chord="C")
+        context.chart_available = True
+        context.clock_bar = 1
+        context.clock_beat = 1
+        bass.on_musical_context(context)
+
+        # A interface demorou a despachar a nova posição: a saída já passou
+        # pelo horário que o agendador antigo escolheria para a nota G.
+        bass.synthesizer.render_chunk(300, 1000, .55)
+        self.assertAlmostEqual(bass.synthesizer.rendered_until_time, .85)
+        context.chord = "G"
+        context.timestamp = .55
+        context.beat = 2
+        context.clock_beat = 2
+        context.beat_position = .1
+        context.output_latency = 46.0
+        changed = bass.on_musical_context(context)
+        self.assertTrue(changed.note.startswith("G"))
+        self.assertAlmostEqual(changed.start_time, .86)
+        bass.synthesizer.render_chunk(50, 1000, .85)
+        self.assertTrue(bass.synthesizer.playing_event.note.startswith("G"))
+
     def test_chart_transition_cancels_old_root_before_confirmed_new_root(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           note_value=BassNoteValue.HALF,

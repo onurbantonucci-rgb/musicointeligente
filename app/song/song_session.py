@@ -475,9 +475,12 @@ class SongSession:
                 self._set_performance_state(PerformanceState.PLAYING)
             return True
         if activity:
-            if self._performance_state in (PerformanceState.WAITING,
-                                           PerformanceState.HOLDING,
-                                           PerformanceState.UNCERTAIN):
+            if self._performance_state == PerformanceState.UNCERTAIN:
+                # Uma respiração menor que a pausa real não exige esperar outro
+                # downbeat: o músico nunca parou a execução.
+                self._set_performance_state(PerformanceState.PLAYING)
+            elif self._performance_state in (PerformanceState.WAITING,
+                                             PerformanceState.HOLDING):
                 self._set_performance_state(PerformanceState.RECOVERING)
                 self._recovery_started_at = timestamp
                 self._recovery_evidence = 0
