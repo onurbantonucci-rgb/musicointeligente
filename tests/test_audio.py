@@ -8,6 +8,7 @@ import soundfile as sf
 
 from app.audio.audio_loader import FileAudioSource
 from app.audio.audio_player import AudioPlayer, PlaybackState
+from app.analysis.audio_analyzer import AudioAnalyzer
 from app.utils.audio_generator import generate_test_song, generate_tone
 
 
@@ -77,6 +78,26 @@ class TestAudioLayer(unittest.TestCase):
         self.assertEqual(chunk_playback.shape, (512, 2))
         self.assertEqual(chunk_playback.dtype, np.float32)
         source.close()
+
+    def test_analysis_channel_can_use_one_stereo_side_without_downmix(self):
+        source = FileAudioSource(self.wav_file)
+        source.set_analysis_channel(1)
+        chunk = source.get_analysis_chunk_at(0, 512)
+        self.assertEqual(chunk.shape, (512,))
+        np.testing.assert_allclose(chunk, source.multichannel_data[:512, 1])
+        source.set_analysis_channel(None)
+        np.testing.assert_allclose(source.get_analysis_chunk_at(0, 512),
+                                   source.mono_data[:512])
+        source.close()
+
+    def test_auto_channel_prefers_side_with_clear_harmony(self):
+        sr = 44100
+        t = np.arange(sr * 3, dtype=np.float32) / sr
+        chord = sum(np.sin(2 * np.pi * freq * t)
+                    for freq in (130.81, 164.81, 196.00)).astype(np.float32) * .12
+        stereo = np.column_stack((np.zeros_like(chord), chord))
+        selected = AudioAnalyzer.recommend_analysis_channel(stereo, sr)
+        self.assertEqual(selected, 1)
 
     def test_audio_seek(self):
         """Valida movimentação do cursor de leitura (seek)."""

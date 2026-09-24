@@ -32,6 +32,7 @@ class FileAudioSource(AudioSource):
         self._duration: float = 0.0
         self._total_frames: int = 0
         self._channels: int = 1
+        self._analysis_channel: Optional[int] = None
         self._position_frame: int = 0
 
         # Áudio em memória
@@ -148,6 +149,38 @@ class FileAudioSource(AudioSource):
                 return padded
             return chunk.copy()
 
+    def get_analysis_chunk_at(self, start_frame: int, chunk_size: int) -> np.ndarray:
+        """Lê o canal de análise escolhido sem alterar o cursor de reprodução."""
+        with self._lock:
+            if not self._active or self._total_frames == 0:
+                return np.zeros(chunk_size, dtype=np.float32)
+            start = max(0, start_frame)
+            end = min(start + chunk_size, self._total_frames)
+            if self._analysis_channel is None or self._channels == 1:
+                chunk = self._mono_data[start:end]
+            else:
+                chunk = self._playback_data[start:end, self._analysis_channel]
+            if len(chunk) < chunk_size:
+                padded = np.zeros(chunk_size, dtype=np.float32)
+                padded[:len(chunk)] = chunk
+                return padded
+            return chunk.copy()
+
+    def set_analysis_channel(self, channel: Optional[int]) -> None:
+        """Seleciona um canal fixo para o ouvido; ``None`` usa a mistura mono."""
+        with self._lock:
+            if channel is None or self._channels == 1:
+                self._analysis_channel = None
+                return
+            value = int(channel)
+            if value < 0 or value >= self._channels:
+                raise ValueError(f"Canal de análise inválido: {value}")
+            self._analysis_channel = value
+
+    @property
+    def analysis_channel(self) -> Optional[int]:
+        return self._analysis_channel
+
     def seek(self, position_seconds: float) -> None:
         """Move o cursor de leitura para o tempo especificado."""
         with self._lock:
@@ -201,6 +234,11 @@ class FileAudioSource(AudioSource):
     def mono_data(self) -> np.ndarray:
         """Acesso somente-leitura ao sinal mono completo."""
         return self._mono_data
+
+    @property
+    def multichannel_data(self) -> np.ndarray:
+        """Acesso somente-leitura aos canais originais para calibração."""
+        return self._playback_data
 
     def get_waveform_envelope(self, num_points: int = 800) -> Tuple[np.ndarray, np.ndarray]:
         """Calcula min/max decimados para renderização gráfica instantânea de waveform.

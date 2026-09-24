@@ -26,7 +26,7 @@ from app.analysis.pitch_detector import PitchDetector, PitchResult, create_pitch
 from app.analysis.chroma_extractor import ChromaExtractor
 from app.analysis.active_notes import ActiveNoteTracker
 from app.analysis.harmonic_analyzer import HarmonicAnalyzer, DefaultHarmonicAnalyzer
-from app.analysis.chord_detector import Chord
+from app.analysis.chord_detector import Chord, ChordDetector
 from app.analysis.chord_history import ChordHistory, ChordEvent
 from app.analysis.key_detector import KeyDetector, KeyResult, KrumhanslSchmucklerKeyDetector
 from app.analysis.key_history import KeyHistory, KeyEvent
@@ -100,6 +100,47 @@ class AudioAnalyzer:
     @classmethod
     def get_available_algorithms(cls) -> List[str]:
         return list(AVAILABLE_PITCH_DETECTORS.keys())
+
+    @staticmethod
+    def recommend_analysis_channel(audio: np.ndarray, sample_rate: int,
+                                   probe_seconds: float = 30.0) -> Optional[int]:
+        """Escolhe um canal estéreo fixo com evidência harmônica mais nítida.
+
+        A escolha é feita uma vez por arquivo. Isso evita cancelamento de fase e
+        também evita trocar de canal no meio da execução, o que pareceria uma
+        mudança musical inexistente. ``None`` preserva a mistura mono quando os
+        canais são equivalentes.
+        """
+        data = np.asarray(audio)
+        if data.ndim != 2 or data.shape[1] < 2 or sample_rate <= 0:
+            return None
+        usable = min(len(data), int(max(1.0, probe_seconds) * sample_rate))
+        if usable < 512:
+            return None
+        chunk_size = min(4096, usable)
+        probe_step = max(chunk_size, sample_rate // 4)
+        starts = np.arange(0, max(1, usable - chunk_size + 1), probe_step,
+                           dtype=int)[:120]
+        scores = []
+        for channel in range(min(2, data.shape[1])):
+            extractor = ChromaExtractor(method="harmonic")
+            detector = ChordDetector()
+            confidences = []
+            for start in starts:
+                chunk = data[start:start + chunk_size, channel]
+                if float(np.sqrt(np.mean(np.square(chunk.astype(np.float64))))) < 0.005:
+                    continue
+                chroma = extractor.extract(chunk, sample_rate)
+                result = detector.detect(chroma, chunk, sample_rate,
+                                         timestamp=float(start) / sample_rate)
+                if result.symbol != "--":
+                    confidences.append(result.confidence)
+            clarity = float(np.mean(confidences)) if confidences else 0.0
+            scores.append(clarity)
+        if len(scores) < 2 or max(scores) <= 0.0:
+            return None
+        best = int(np.argmax(scores))
+        return best if scores[best] - min(scores) >= 0.0025 else None
 
     @property
     def context(self) -> MusicalContext:

@@ -115,8 +115,78 @@ class OnsetTempoDetector(TempoDetector):
             return self._bpm
         except Exception as e:
             print(f"[TempoDetector] Erro ao detectar tempo: {e}")
+            return self._analyze_audio_fallback(audio_data, sample_rate)
+
+    def _analyze_audio_fallback(self, audio_data: np.ndarray, sample_rate: int) -> float:
+        """Rastreador NumPy usado quando a biblioteca principal não está disponível."""
+        audio = np.asarray(audio_data, dtype=np.float64)
+        if audio.ndim == 2:
+            audio = np.mean(audio, axis=1)
+        if len(audio) < sample_rate * 2:
             self._bpm = 0.0
             return 0.0
+
+        decimation = max(1, int(np.ceil(sample_rate / 22050.0)))
+        signal = audio[::decimation]
+        effective_rate = sample_rate / decimation
+        frame_size = 1024
+        hop_size = 256
+        frame_count = 1 + (len(signal) - frame_size) // hop_size
+        if frame_count < 4:
+            self._bpm = 0.0
+            return 0.0
+
+        window = np.hanning(frame_size)
+        onset = np.zeros(frame_count, dtype=np.float64)
+        previous = None
+        for index in range(frame_count):
+            start = index * hop_size
+            magnitude = np.abs(np.fft.rfft(signal[start:start + frame_size] * window))
+            magnitude /= max(1e-9, float(np.linalg.norm(magnitude)))
+            if previous is not None:
+                onset[index] = float(np.sum(np.maximum(magnitude - previous, 0.0)))
+            previous = magnitude
+        onset = np.convolve(onset, np.ones(3, dtype=np.float64) / 3.0, mode="same")
+        threshold = float(np.percentile(onset, 75.0))
+        candidates = np.where(
+            (onset[1:-1] > onset[:-2]) &
+            (onset[1:-1] >= onset[2:]) &
+            (onset[1:-1] > threshold)
+        )[0] + 1
+        min_distance = max(1, int(0.28 * effective_rate / hop_size))
+        peaks = []
+        for candidate in candidates:
+            if not peaks or candidate - peaks[-1] >= min_distance:
+                peaks.append(int(candidate))
+            elif onset[candidate] > onset[peaks[-1]]:
+                peaks[-1] = int(candidate)
+        if len(peaks) < 4:
+            self._bpm = 0.0
+            self._beat_times = np.array([], dtype=np.float32)
+            return 0.0
+
+        peak_times = np.asarray(peaks, dtype=np.float64) * hop_size / effective_rate
+        intervals = np.diff(peak_times)
+        intervals = intervals[(intervals >= 0.28) & (intervals <= 1.20)]
+        if len(intervals) < 3:
+            self._bpm = 0.0
+            self._beat_times = np.array([], dtype=np.float32)
+            return 0.0
+        interval = float(np.median(intervals))
+        bpm = 60.0 / interval
+        if bpm < 70.0:
+            bpm *= 2.0
+            interval /= 2.0
+        elif bpm > 190.0:
+            bpm /= 2.0
+            interval *= 2.0
+        self._bpm = float(bpm)
+        duration = len(audio) / float(sample_rate)
+        self._beat_times = np.arange(peak_times[0], duration, interval, dtype=np.float32)
+        self._last_beat_idx = -1
+        print(f"[TempoDetector] BPM por fallback: {self._bpm:.1f} | "
+              f"Total de batidas: {len(self._beat_times)}")
+        return self._bpm
 
     def get_tempo_at_time(self, timestamp: float, tolerance_sec: float = 0.075) -> TempoResult:
         """Determina se o instante atual de reprodução coincide com um pulso de batida."""

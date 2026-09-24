@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from unittest.mock import Mock, patch
 import numpy as np
 
 from app.analysis.tempo_detector import OnsetTempoDetector
@@ -34,6 +35,17 @@ class TestTempoAndKeyAnalysis(unittest.TestCase):
         # Tolerância razoável para andamento musical
         self.assertAlmostEqual(bpm, 120.0, delta=4.0)
         self.assertGreater(len(self.tempo_detector.beat_times), 15)
+
+    def test_numpy_fallback_keeps_tempo_when_primary_backend_fails(self):
+        source = FileAudioSource(self.test_wav)
+        detector = OnsetTempoDetector()
+        unavailable = Mock()
+        unavailable.beat.beat_track.side_effect = RuntimeError("backend indisponível")
+        with patch("app.analysis.tempo_detector.librosa", unavailable):
+            bpm = detector.analyze_audio(source.mono_data, source.get_sample_rate())
+        source.close()
+        self.assertAlmostEqual(bpm, 120.0, delta=4.0)
+        self.assertGreater(len(detector.beat_times), 15)
 
     def test_beat_pulse_matching(self):
         """Valida se o tracker detecta pulso quando o timestamp coincide com a batida."""

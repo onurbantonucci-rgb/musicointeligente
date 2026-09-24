@@ -80,6 +80,13 @@ class MainWindow:
         "Cifra + confirmação do áudio": BassHarmonySource.FOLLOW,
     }
 
+    ANALYSIS_CHANNELS = (
+        "Automático",
+        "Mistura estéreo",
+        "Canal esquerdo",
+        "Canal direito",
+    )
+
     def __init__(self, root: tk.Tk, project_file_path: Optional[str] = None):
         self.root = root
         self.root.title("Virtual Band AI — Musician Play-Along & Banda Virtual (v0.4)")
@@ -112,6 +119,7 @@ class MainWindow:
         # Flags e rastreadores de interface
         self._is_user_dragging_slider = False
         self._current_source: FileAudioSource = None
+        self._recommended_analysis_channel: Optional[int] = None
         self._last_rendered_events_count = 0
         self._last_rendered_bass_events_count = 0
         self._update_counter = 0
@@ -283,6 +291,18 @@ class MainWindow:
         self.combo_algo.set("Autocorrelação")
         self.combo_algo.pack(side="left")
         self.combo_algo.bind("<<ComboboxSelected>>", self._on_algo_changed)
+
+        hearing_row = tk.Frame(file_frame, bg="#181d26")
+        hearing_row.pack(fill="x", pady=(6, 0))
+        tk.Label(hearing_row, text="Referência analisada:", bg="#181d26", fg="#8c9ba5",
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 6))
+        self.combo_analysis_channel = ttk.Combobox(
+            hearing_row, values=self.ANALYSIS_CHANNELS, state="readonly",
+            width=18, font=("Segoe UI", 8))
+        self.combo_analysis_channel.set("Automático")
+        self.combo_analysis_channel.pack(side="left")
+        self.combo_analysis_channel.bind("<<ComboboxSelected>>",
+                                         self._on_analysis_channel_changed)
 
         # Linha de Metadados
         meta_row = tk.Frame(file_frame, bg="#181d26")
@@ -1054,6 +1074,10 @@ class MainWindow:
             self.root.update_idletasks()
 
             source = FileAudioSource(file_path)
+            self._recommended_analysis_channel = self.analyzer.recommend_analysis_channel(
+                source.multichannel_data, source.get_sample_rate())
+            self.combo_analysis_channel.set("Automático")
+            source.set_analysis_channel(self._recommended_analysis_channel)
             self._audio_generation += 1
             self.analyzer.reset_musical_history()
             self._current_source = source
@@ -1078,10 +1102,12 @@ class MainWindow:
             duration = source.get_duration()
             sr = source.get_sample_rate()
             channels_txt = "Estéreo (2 canais)" if source.channels == 2 else f"{source.channels} canal(is)"
+            heard_txt = self._analysis_channel_description(source)
 
             self.lbl_file_name.config(text=source.name)
             self.lbl_meta_details.config(
-                text=f"Duração: {self._format_time(duration)}  |  Sample Rate: {sr} Hz  |  Canais: {channels_txt}"
+                text=(f"Duração: {self._format_time(duration)}  |  Sample Rate: {sr} Hz  |  "
+                      f"Canais: {channels_txt}  |  Ouvindo: {heard_txt}")
             )
             self.lbl_time_total.config(text=self._format_time(duration))
             self.seek_slider.config(to=duration)
@@ -1239,7 +1265,7 @@ class MainWindow:
 
                 if state == PlaybackState.PLAYING or self._is_user_dragging_slider:
                     frame_idx = int(pos * sr)
-                    chunk = self._current_source.get_chunk_at(frame_idx, 4096)
+                    chunk = self._current_source.get_analysis_chunk_at(frame_idx, 4096)
                     ctx = self.analyzer.analyze_chunk(chunk, sr, pos,
                                                       session=self.project_manager.active_session,
                                                       players=self.virtual_players)
@@ -1559,6 +1585,37 @@ class MainWindow:
         algo = self.combo_algo.get()
         self.analyzer.set_pitch_detector(algo)
         self.lbl_status_msg.config(text=f"Algoritmo de detecção de pitch alterado para: {algo}")
+
+    def _analysis_channel_description(self, source: FileAudioSource) -> str:
+        if source.channels <= 1:
+            return "mono"
+        automatic = self.combo_analysis_channel.get() == "Automático"
+        suffix = " (automático)" if automatic else ""
+        if source.analysis_channel == 0:
+            return f"canal esquerdo{suffix}"
+        if source.analysis_channel == 1:
+            return f"canal direito{suffix}"
+        return f"mistura estéreo{suffix}"
+
+    def _on_analysis_channel_changed(self, event=None) -> None:
+        source = self._current_source
+        if source is None:
+            return
+        choice = self.combo_analysis_channel.get()
+        channel = (self._recommended_analysis_channel if choice == "Automático" else
+                   0 if choice == "Canal esquerdo" else
+                   1 if choice == "Canal direito" else None)
+        if source.channels <= 1:
+            channel = None
+        source.set_analysis_channel(channel)
+        heard_txt = self._analysis_channel_description(source)
+        channels_txt = "Estéreo (2 canais)" if source.channels == 2 else f"{source.channels} canal(is)"
+        self.lbl_meta_details.config(
+            text=(f"Duração: {self._format_time(source.get_duration())}  |  "
+                  f"Sample Rate: {source.get_sample_rate()} Hz  |  "
+                  f"Canais: {channels_txt}  |  Ouvindo: {heard_txt}"))
+        self.lbl_status_msg.config(
+            text=f"Referência de análise alterada para {heard_txt}. O ouvido se ajustará nos próximos instantes.")
 
     def _update_transport_state(self, state: PlaybackState) -> None:
         if state == PlaybackState.PLAYING:
