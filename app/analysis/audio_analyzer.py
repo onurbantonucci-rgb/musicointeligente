@@ -325,10 +325,13 @@ class AudioAnalyzer:
             # 2. Extração de Cromagrama (12 Classes de Notas)
             raw_chroma: np.ndarray = self._chroma_extractor.extract(audio_chunk, sample_rate)
 
-            # Em acompanhamento com cifra, o tom escrito/selecionado é a fonte
-            # autoritativa. A estimativa estatística permanece no modo livre.
-            chart_key = (session.song.performance_settings.key_override or session.chart.key
-                         if session is not None and session.alignment.event_count else None)
+            # A origem do tom é uma escolha independente da existência da
+            # cifra. O prior harmônico da cifra continua ativo nos dois modos.
+            has_chart = bool(session is not None and session.alignment.event_count)
+            key_source = (getattr(session.song.performance_settings, "key_source", "CHART").upper()
+                          if session is not None else "AUDIO")
+            chart_key = ((session.song.performance_settings.key_override or session.chart.key)
+                         if has_chart and key_source == "CHART" else None)
             key_hint = chart_key or self._key_hint
             active_state = self._active_note_tracker.update(
                 raw_chroma, timestamp, key=key_hint or "--", audio_activity=audio_activity)
@@ -380,7 +383,7 @@ class AudioAnalyzer:
                 lat_metrics=lat_metrics,
                 audio_activity=audio_activity,
             )
-            ctx.expected_chart_chord = (session.expected_chord if chart_key is not None
+            ctx.expected_chart_chord = (session.expected_chord if has_chart
                                         else self._expected_chord) or "--"
             ctx.chart_prior_enabled = chart_prior_enabled
 

@@ -75,11 +75,19 @@ class ActiveVoice:
             0.06 * np.sin(4.0 * w1 * t)
         )
 
-        # Transiente de palheta/dedilhado nos primeiros 12 ms
+        # Transiente de palheta/dedilhado nos primeiros 12 ms. Ele é um ruído
+        # curto, determinístico e sem relação harmônica com a fundamental: o
+        # antigo seno em 5*f podia colorir D como F# no ataque.
         pluck_len = min(self.total_samples, int(0.012 * sample_rate))
         if pluck_len > 0:
-            pluck_t = t[:pluck_len]
-            pluck = np.sin(5.0 * w1 * pluck_t) * np.exp(-pluck_t / 0.003) * 0.30
+            index = np.arange(pluck_len, dtype=np.float32)
+            noise = np.sin((index + 1.0) * 12.9898) * 43758.5453
+            noise = (noise - np.floor(noise)) * 2.0 - 1.0
+            # Diferenciação remove a componente grave e preserva o caráter de
+            # ataque sem sugerir nenhuma terça específica.
+            noise[1:] -= noise[:-1]
+            peak = max(float(np.max(np.abs(noise))), 1e-6)
+            pluck = (noise / peak) * np.exp(-t[:pluck_len] / 0.003) * 0.12
             wave[:pluck_len] += pluck
 
         # Sinal completo da nota normalizado e amplificado pela dinâmica (velocity)

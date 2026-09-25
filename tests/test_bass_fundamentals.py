@@ -235,7 +235,7 @@ class TestBassFundamentals(unittest.TestCase):
         context.beat_position = .1
         changed = bass.on_musical_context(context)
         self.assertTrue(changed.note.startswith("G"))
-        self.assertAlmostEqual(changed.start_time, .57)
+        self.assertAlmostEqual(changed.start_time, .56)
         self.assertEqual(len(bass.synthesizer.scheduled_events), 1)
 
         bass.synthesizer.render_chunk(100, 1000, .55)
@@ -244,7 +244,7 @@ class TestBassFundamentals(unittest.TestCase):
         context.beat_position = .6
         following = bass.on_musical_context(context)
         self.assertEqual((following.bar, following.beat), (1, 4))
-        self.assertAlmostEqual(following.start_time, 1.5)
+        self.assertAlmostEqual(following.start_time, 1.55)
 
     def test_same_root_chart_quality_change_does_not_add_an_attack(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
@@ -264,7 +264,7 @@ class TestBassFundamentals(unittest.TestCase):
         self.assertEqual((event.bar, event.beat), (1, 3))
         self.assertAlmostEqual(event.start_time, 1.0)
 
-    def test_chart_change_during_recovery_waits_for_safe_downbeat(self):
+    def test_chart_change_during_recovery_enters_immediately(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           note_value=BassNoteValue.HALF,
                           harmony_source=BassHarmonySource.CHART)
@@ -280,8 +280,8 @@ class TestBassFundamentals(unittest.TestCase):
         context.beat_position = .1
         context.performance_state = "RECOVERING"
         event = bass.on_musical_context(context)
-        self.assertEqual((event.bar, event.beat), (2, 1))
-        self.assertGreater(event.start_time, 1.0)
+        self.assertTrue(event.note.startswith("G"))
+        self.assertLess(event.start_time, 1.0)
 
     def test_chart_change_stays_ahead_of_known_output_buffer(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
@@ -299,7 +299,7 @@ class TestBassFundamentals(unittest.TestCase):
         context.beat_position = .1
         context.output_latency = 46.0
         event = bass.on_musical_context(context)
-        self.assertAlmostEqual(event.start_time, .606)
+        self.assertAlmostEqual(event.start_time, .600)
         bass.synthesizer.render_chunk(46, 1000, .55)
         self.assertIsNone(bass.synthesizer.playing_event)
         bass.synthesizer.render_chunk(46, 1000, .596)
@@ -327,7 +327,7 @@ class TestBassFundamentals(unittest.TestCase):
         context.output_latency = 46.0
         changed = bass.on_musical_context(context)
         self.assertTrue(changed.note.startswith("G"))
-        self.assertAlmostEqual(changed.start_time, .86)
+        self.assertAlmostEqual(changed.start_time, .854)
         bass.synthesizer.render_chunk(50, 1000, .85)
         self.assertTrue(bass.synthesizer.playing_event.note.startswith("G"))
 
@@ -339,7 +339,7 @@ class TestBassFundamentals(unittest.TestCase):
         context.chart_available = True
         context.clock_bar = 2
         context.clock_beat = 1
-        context.chart_clock_chord = "B"
+        context.chart_published_chord = "B"
         old = bass.on_musical_context(context)
         self.assertTrue(old.note.startswith("B"))
         self.assertEqual(len(bass.synthesizer.scheduled_events), 1)
@@ -349,13 +349,13 @@ class TestBassFundamentals(unittest.TestCase):
         context.beat_position = .8
         context.next_expected_chord = "F#"
         context.next_change_bar = 2
-        context.chart_clock_chord = "F#"
+        context.chart_published_chord = "F#"
         context.chord_candidate = "F#"
         context.chord_candidate_confidence = .7
-        self.assertIsNone(bass.on_musical_context(context))
-        self.assertEqual(bass.synthesizer.scheduled_events, [])
-        bass.synthesizer.render_chunk(100, 1000, .95)
-        self.assertIsNone(bass.synthesizer.playing_event)
+        changed = bass.on_musical_context(context)
+        self.assertTrue(changed.note.startswith("F#"))
+        self.assertTrue(all(event.note.startswith("F#")
+                            for event in bass.synthesizer.scheduled_events))
 
         context.chord = "F#"
         context.timestamp = 1.05
@@ -364,16 +364,15 @@ class TestBassFundamentals(unittest.TestCase):
         new = bass.on_musical_context(context)
         self.assertTrue(new.note.startswith("F#"))
         context.next_expected_chord = "G"
-        context.chart_clock_chord = "G"
+        context.chart_published_chord = "F#"
         context.chord_candidate = "G"
         context.timestamp = 1.06
         context.beat_position = .12
         self.assertIsNone(bass.on_musical_context(context))
-        self.assertEqual(len(bass.synthesizer.scheduled_events), 1)
-        bass.synthesizer.render_chunk(100, 1000, 1.05)
+        bass.synthesizer.render_chunk(100, 1000, .90)
         self.assertTrue(bass.synthesizer.playing_event.note.startswith("F#"))
 
-    def test_chart_transition_bar_blocks_old_root_without_clock_chord_hint(self):
+    def test_chart_mode_does_not_advance_from_clock_without_published_change(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           note_value=BassNoteValue.HALF,
                           harmony_source=BassHarmonySource.CHART)
@@ -385,8 +384,8 @@ class TestBassFundamentals(unittest.TestCase):
         context.next_expected_chord = "D#m"
         context.next_change_bar = 8
         context.chart_clock_chord = "C#"
-        self.assertIsNone(bass.on_musical_context(context))
-        self.assertEqual(bass.synthesizer.scheduled_events, [])
+        event = bass.on_musical_context(context)
+        self.assertTrue(event.note.startswith("B"))
 
     def test_first_chart_chord_is_not_a_change_from_missing_chord(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
@@ -418,7 +417,7 @@ class TestBassFundamentals(unittest.TestCase):
         event = bass.on_musical_context(context)
         self.assertTrue(event.note.startswith("B"))
 
-    def test_clock_hint_and_stable_audio_disagreement_hold_old_root(self):
+    def test_clock_hint_and_stable_audio_do_not_veto_published_root(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           note_value=BassNoteValue.HALF,
                           harmony_source=BassHarmonySource.CHART)
@@ -433,10 +432,10 @@ class TestBassFundamentals(unittest.TestCase):
         context.stable_chord_confidence = .8
         context.stable_chord_duration = .3
         context.audio_activity = .1
-        self.assertIsNone(bass.on_musical_context(context))
-        self.assertEqual(bass.synthesizer.scheduled_events, [])
+        event = bass.on_musical_context(context)
+        self.assertTrue(event.note.startswith("B"))
 
-    def test_next_chart_chord_candidate_holds_old_root_before_cursor_moves(self):
+    def test_audio_candidate_does_not_change_published_root(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
                           note_value=BassNoteValue.HALF,
                           harmony_source=BassHarmonySource.CHART)
@@ -449,8 +448,8 @@ class TestBassFundamentals(unittest.TestCase):
         context.chart_clock_chord = "B"
         context.chord_candidate = "F#"
         context.chord_candidate_confidence = .65
-        self.assertIsNone(bass.on_musical_context(context))
-        self.assertEqual(bass.synthesizer.scheduled_events, [])
+        event = bass.on_musical_context(context)
+        self.assertTrue(event.note.startswith("B"))
 
     def test_chart_only_legacy_pattern_also_uses_playalong_chord(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.ROOT,
@@ -533,11 +532,66 @@ class TestBassFundamentals(unittest.TestCase):
         self.assertIsNone(synth.playing_event)
         self.assertEqual(synth.scheduled_events, [])
 
+    def test_chart_change_cancels_old_pending_note_and_ignores_audio(self):
+        """A posição destacada é a autoridade, mesmo com áudio contraditório."""
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          note_value=BassNoteValue.HALF,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.25, beat=1, phase=.5, chord="F#")
+        context.chart_available = True
+        context.chart_published_chord = "C"
+        context.clock_bar = context.clock_beat = 1
+        bass.on_musical_context(context)
+        self.assertTrue(bass.synthesizer.scheduled_events[0].note.startswith("C"))
+
+        context.timestamp = .55
+        context.beat = context.clock_beat = 2
+        context.beat_position = .1
+        context.chart_published_chord = "Dm"
+        context.smoothed_detected_chord = "F#"
+        context.stable_chord_confidence = .99
+        context.harmonic_event_chord = "F#"
+        context.follow_confidence_level = "LOW"
+        changed = bass.on_musical_context(context)
+        self.assertTrue(changed.note.startswith("D"))
+        self.assertTrue(all(event.note.startswith("D")
+                            for event in bass.synthesizer.scheduled_events))
+
+    def test_chart_change_is_immediate_in_uncertain_and_recovering(self):
+        for state in ("UNCERTAIN", "RECOVERING"):
+            with self.subTest(state=state):
+                bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                                  note_value=BassNoteValue.HALF,
+                                  harmony_source=BassHarmonySource.CHART)
+                context = self.context(timestamp=.25, beat=1, phase=.5, chord="C")
+                context.chart_available = True
+                context.chart_published_chord = "C"
+                context.clock_bar = context.clock_beat = 1
+                bass.on_musical_context(context)
+                context.timestamp = .55
+                context.beat = context.clock_beat = 2
+                context.beat_position = .1
+                context.performance_state = state
+                context.chart_published_chord = "D"
+                event = bass.on_musical_context(context)
+                self.assertTrue(event.note.startswith("D"))
+                self.assertLess(event.start_time, 1.0)
+
+    def test_fundamentals_share_d_root_and_inversions(self):
+        for chord in ("D", "Dm", "Dm7", "Dm9", "Dm/F"):
+            with self.subTest(chord=chord):
+                decision = BassDecisionEngine().decide(
+                    self.context(chord=chord), pattern_override=BassPatternType.FUNDAMENTALS)
+                self.assertTrue(decision.root_note.startswith("D"))
+
 
 class TestBassChartModeUI(unittest.TestCase):
     def test_chart_source_is_selectable_in_bassist_tab(self):
         with tempfile.TemporaryDirectory() as folder:
-            root = tk.Tk()
+            try:
+                root = tk.Tk()
+            except tk.TclError as exc:
+                self.skipTest(f"Tk indisponível neste ambiente: {exc}")
             root.withdraw()
             try:
                 window = MainWindow(root, project_file_path=f"{folder}/project.json")

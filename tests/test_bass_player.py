@@ -295,6 +295,18 @@ class TestBassPlayer(unittest.TestCase):
         silent_chunk = self.synth.render_chunk(frames=1024, sample_rate=44100)
         self.assertTrue(np.all(silent_chunk == 0.0), "Volume 0.0 deve produzir silêncio estrito")
 
+    def test_11b_attack_has_no_deliberate_fifth_harmonic_tone(self):
+        """O ataque de D não pode carregar um seno forte em 5*f (F#)."""
+        midi_d = 38
+        sr = 44100
+        audio = BassSynthesizer(sample_rate=sr).synthesize_note_to_array(
+            midi_d, duration=.08, sr=sr)
+        attack = audio[:int(.012 * sr)]
+        t = np.arange(len(attack), dtype=np.float32) / sr
+        fundamental = abs(np.dot(attack, np.sin(2 * np.pi * 73.416 * t)))
+        fifth = abs(np.dot(attack, np.sin(2 * np.pi * 5 * 73.416 * t)))
+        self.assertLess(fifth, fundamental * .45)
+
     # -------------------------------------------------------------
     # 12. Teste integrado com áudio real: violao_teste_120bpm.wav
     # -------------------------------------------------------------

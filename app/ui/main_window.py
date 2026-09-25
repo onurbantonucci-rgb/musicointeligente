@@ -87,6 +87,15 @@ class MainWindow:
         "Canal direito",
     )
 
+    BPM_SOURCES = {
+        "BPM da música (áudio)": "AUDIO",
+        "BPM informado na cifra": "CHART",
+    }
+    KEY_SOURCES = {
+        "Tom informado na cifra": "CHART",
+        "Tom detectado no áudio": "AUDIO",
+    }
+
     def __init__(self, root: tk.Tk, project_file_path: Optional[str] = None):
         self.root = root
         self.root.title("Virtual Band AI — Musician Play-Along & Banda Virtual (v0.4)")
@@ -445,6 +454,26 @@ class MainWindow:
     def _build_analysis_dashboard(self, parent: Optional[tk.Frame] = None) -> None:
         """Painel de Métricas Musicais (Fases 11, 12 e 13)."""
         target = parent if parent is not None else self.root
+        source_bar = tk.Frame(target, bg="#11141a")
+        source_bar.pack(fill="x", padx=12, pady=(6, 0))
+        tk.Label(source_bar, text="REFERÊNCIAS DA MÚSICA", bg="#11141a", fg="#00d2ff",
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 10))
+        tk.Label(source_bar, text="BPM:", bg="#11141a", fg="#8c9ba5",
+                 font=("Segoe UI", 8)).pack(side="left")
+        self.combo_bpm_source = ttk.Combobox(
+            source_bar, values=tuple(self.BPM_SOURCES), state="readonly", width=23,
+            font=("Segoe UI", 8))
+        self.combo_bpm_source.set("BPM da música (áudio)")
+        self.combo_bpm_source.pack(side="left", padx=(4, 16))
+        self.combo_bpm_source.bind("<<ComboboxSelected>>", self._on_bpm_source_changed)
+        tk.Label(source_bar, text="Tom:", bg="#11141a", fg="#8c9ba5",
+                 font=("Segoe UI", 8)).pack(side="left")
+        self.combo_key_source = ttk.Combobox(
+            source_bar, values=tuple(self.KEY_SOURCES), state="readonly", width=23,
+            font=("Segoe UI", 8))
+        self.combo_key_source.set("Tom informado na cifra")
+        self.combo_key_source.pack(side="left", padx=4)
+        self.combo_key_source.bind("<<ComboboxSelected>>", self._on_key_source_changed)
         dash_frame = tk.Frame(target, bg="#11141a")
         dash_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
@@ -777,6 +806,10 @@ class MainWindow:
         self.lbl_bass_reason.pack(pady=2)
         self.lbl_bass_voice_leading = tk.Label(c2, text="Condução harmônica inteligente", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
         self.lbl_bass_voice_leading.pack()
+        self.lbl_bass_chart_source = tk.Label(c2, text="Cifra agora: --  |  Fonte: --",
+                                               bg="#141820", fg="#8c9ba5",
+                                               font=("Segoe UI", 7))
+        self.lbl_bass_chart_source.pack()
 
         # Card 3: Padrão em Execução
         c3 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
@@ -1333,7 +1366,9 @@ class MainWindow:
 
                     # 3. Tonalidade Estimada & Tempo no Tom
                     chart_key_active = bool(self.project_manager.active_session and
-                                            self.project_manager.active_session.alignment.event_count)
+                                            self.project_manager.active_session.alignment.event_count and
+                                            getattr(self.project_manager.active_session.song.performance_settings,
+                                                    "key_source", "CHART").upper() == "CHART")
                     self.lbl_key_source.config(text=("TOM DA CIFRA / SELETOR" if chart_key_active
                                                      else "TONALIDADE ESTIMADA"))
                     if ctx.key != "--":
@@ -1407,6 +1442,11 @@ class MainWindow:
                                     cur_dec.pattern_type.value.upper() if cur_dec else bass.pattern.value.upper())
                         self.lbl_bass_pattern_active.config(text=pat_name, fg="#00d2ff")
                         self.lbl_bass_sub_pattern.config(text=self.combo_bass_note_value.get())
+                        chart_now = getattr(ctx, "chart_published_chord", "--")
+                        source_name = "Cifra" if bass.harmony_source == BassHarmonySource.CHART else "Cifra + áudio"
+                        self.lbl_bass_chart_source.config(
+                            text=f"Cifra agora: {chart_now}  |  Fonte: {source_name}",
+                            fg="#00e676" if bass.harmony_source == BassHarmonySource.CHART else "#8c9ba5")
                         if playing is not None:
                             self.lbl_bass_note.config(text=playing.note, fg="#00e676")
                             freq = midi_to_hz(playing.midi_note)
@@ -2311,6 +2351,7 @@ class MainWindow:
         self.lbl_time_total.config(text="00:00")
         self._update_transport_state(PlaybackState.STOPPED)
         session = self.project_manager.open_song(song)
+        self._sync_reference_sources(song)
 
         if song.audio_path and os.path.exists(song.audio_path):
             self._load_audio_file(song.audio_path)
@@ -2827,6 +2868,47 @@ class MainWindow:
             pass
         return None
 
+    @staticmethod
+    def _source_label(options: dict, value: str) -> str:
+        return next((label for label, code in options.items() if code == value), "")
+
+    def _sync_reference_sources(self, song: Optional[Song] = None) -> None:
+        """Reflete no Laboratório as preferências persistidas da música ativa."""
+        song = song or self._active_song()
+        if song is None:
+            return
+        settings = song.performance_settings
+        if hasattr(self, "combo_bpm_source"):
+            self.combo_bpm_source.set(self._source_label(
+                self.BPM_SOURCES, getattr(settings, "bpm_source", "AUDIO").upper()))
+        if hasattr(self, "combo_key_source"):
+            self.combo_key_source.set(self._source_label(
+                self.KEY_SOURCES, getattr(settings, "key_source", "CHART").upper()))
+
+    def _save_reference_sources(self) -> None:
+        if self.project_manager.project.settings.auto_save:
+            self.project_manager.save_project()
+
+    def _on_bpm_source_changed(self, event=None) -> None:
+        session = self.project_manager.active_session
+        source = self.BPM_SOURCES.get(self.combo_bpm_source.get())
+        if session is None or source is None:
+            return
+        session.set_bpm_source(source)
+        self._save_reference_sources()
+        description = "áudio da música" if source == "AUDIO" else "BPM da cifra"
+        self.lbl_status_msg.config(text=f"BPM seguindo {description}.")
+
+    def _on_key_source_changed(self, event=None) -> None:
+        session = self.project_manager.active_session
+        source = self.KEY_SOURCES.get(self.combo_key_source.get())
+        if session is None or source is None:
+            return
+        session.set_key_source(source)
+        self._save_reference_sources()
+        description = "áudio da música" if source == "AUDIO" else "tom da cifra"
+        self.lbl_status_msg.config(text=f"Tom seguindo {description}.")
+
     def _set_chart_status(self, text: str, fg: str) -> None:
         if hasattr(self, "lbl_chart_edit_status"):
             self.lbl_chart_edit_status.config(text=text, fg=fg)
@@ -3079,6 +3161,7 @@ class MainWindow:
                 self.combo_key.set(key)
             except Exception:
                 pass
+        self._sync_reference_sources(song)
         self._has_unsaved_chart_edits = False
         if reset_history:
             self._chart_edit_history.reset(ChartEditState(txt, -1))

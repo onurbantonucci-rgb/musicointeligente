@@ -92,6 +92,8 @@ class SongSession:
                 bpm=song.bpm,
                 meter=song.meter
             )
+        if self._key_source() == "AUDIO":
+            self._context.key = "--"
 
         # 4. Alinhamento e Fusão
         self._alignment: ChartAlignment = ChartAlignment(self._chart)
@@ -313,12 +315,14 @@ class SongSession:
         self._follow_stability = 0.70
         self._last_follow_timestamp = None
         self._follow_observations_available = False
-        self._clock.bpm = self._song.performance_settings.bpm_override or self._song.bpm
+        if (self._bpm_source() == "CHART" or self._song.performance_settings.bpm_override or
+                not self._follow_observations_available):
+            self._clock.bpm = self._chart_bpm()
         self._clock.reset()
         self._context.reset()
         self._context.bpm = self._clock.bpm
         self._context.meter = self._clock.meter
-        self._context.key = self._song.performance_settings.key_override or self._chart.key
+        self._context.key = self._chart_key() if self._key_source() == "CHART" else "--"
         self._fusion.reset()
         self._structure_analyzer.reset()
         self._harmonic_rhythm.reset()
@@ -341,6 +345,43 @@ class SongSession:
         if was_playing:
             self.start()
         return self._current_chart_pos
+
+    def _bpm_source(self) -> str:
+        return getattr(self._song.performance_settings, "bpm_source", "AUDIO").upper()
+
+    def _key_source(self) -> str:
+        return getattr(self._song.performance_settings, "key_source", "CHART").upper()
+
+    def _chart_bpm(self) -> float:
+        return self._song.performance_settings.bpm_override or self._chart.bpm or self._song.bpm
+
+    def _chart_key(self) -> str:
+        return self._song.performance_settings.key_override or self._chart.key or self._song.key
+
+    def set_bpm_source(self, source: str) -> None:
+        """Altera a fonte do andamento sem criar outro relógio musical."""
+        source = str(source).upper()
+        if source not in ("AUDIO", "CHART"):
+            raise ValueError("Fonte de BPM inválida")
+        self._song.performance_settings.bpm_source = source
+        if source == "CHART":
+            self._clock.bpm = self._chart_bpm()
+            self._context.bpm = self._clock.bpm
+
+    def set_key_source(self, source: str) -> None:
+        """Altera a autoridade da tonalidade publicada no contexto."""
+        source = str(source).upper()
+        if source not in ("AUDIO", "CHART"):
+            raise ValueError("Fonte de tom inválida")
+        self._song.performance_settings.key_source = source
+        if source == "CHART":
+            self._context.key = self._chart_key()
+            self._context.key_confidence = 1.0
+        else:
+            # A tela não deve continuar exibindo o tom da cifra enquanto o
+            # detector de áudio ainda junta seus primeiros frames.
+            self._context.key = "--"
+            self._context.key_confidence = 0.0
 
     def close(self) -> None:
         """Libera integralmente todos os recursos e estados da sessão anterior."""
@@ -366,21 +407,32 @@ class SongSession:
         if timestamp < self._clock.elapsed_time - 0.01:
             # Seek da fonte invalida o horário de qualquer evento preparado.
             self._position_generation += 1
+        chart_bpm = self._chart_bpm()
         manual_bpm = self._song.performance_settings.bpm_override
-        # O BPM do contexto do analisador começa em 120 por padrão e não é
-        # uma medição do músico. A cifra mantém o andamento inicial até uma
-        # observação explícita/confiável do detector ou um override manual.
+        # A fonte de BPM é independente da fonte harmônica. Em Cifra não
+        # enviamos pulsos ao PLL, pois eles acabariam alterando a grade que o
+        # usuário pediu para manter fixa.
         if manual_bpm:
             bpm_input = manual_bpm
+            beat_timestamp = None
+            observation_confidence = 0.0
+        elif self._bpm_source() == "CHART":
+            bpm_input = chart_bpm
+            beat_timestamp = None
+            observation_confidence = 0.0
         elif tempo_result is not None:
             bpm_input = (tempo_result.bpm if tempo_result.bpm > 0 and
                          tempo_result.confidence >= .65 else None)
+            beat_timestamp = tempo_result.beat_timestamp
+            observation_confidence = tempo_result.confidence
         else:
             bpm_input = detected_bpm if detected_bpm > 0 else None
+            beat_timestamp = None
+            observation_confidence = 0.0
         self._clock.update(
             timestamp, bpm=bpm_input,
-            beat_timestamp=tempo_result.beat_timestamp if tempo_result else None,
-            observation_confidence=tempo_result.confidence if tempo_result else 0.0)
+            beat_timestamp=beat_timestamp,
+            observation_confidence=observation_confidence)
         raw_detected_chord = detected_chord
         if (detected_chord not in ("", "--", "UNKNOWN", "N") and
                 not ChartSemanticClassifier.is_chord_shaped(detected_chord)):
@@ -556,6 +608,10 @@ class SongSession:
         ctx.next_expected_section = position.next_section_name
         ctx.position_generation = self._position_generation
         ctx.chart_available = bool(self._chart.sections and position.current_chord != "--")
+        # Esta é a única posição de cifra consumida pela UI e pelo baixista em
+        # modo CHART. Não usar o acorde fundido aqui: ele pode representar uma
+        # variação confirmada pela análise de áudio.
+        ctx.chart_published_chord = position.current_chord if ctx.chart_available else "--"
         if self._alignment.event_count:
             chart_bar = max(1, self.clock_bar - self._position_estimator.bar_offset)
             ctx.chart_clock_chord = self._alignment.get_position_at(chart_bar).current_chord
@@ -597,8 +653,9 @@ class SongSession:
         ctx.section_progress = position.section_progress
         ctx.structure_confidence = position.confidence
         ctx.predicted_next_section = state.next_section
-        chart_key = self._song.performance_settings.key_override or self._chart.key
-        if self._alignment.event_count and chart_key not in ("", "--"):
+        chart_key = self._chart_key()
+        if (self._key_source() == "CHART" and self._alignment.event_count and
+                chart_key not in ("", "--")):
             ctx.key = chart_key
             ctx.key_confidence = 1.0
             ctx.previous_key = "--"
@@ -890,11 +947,13 @@ class SongSession:
         self._song.bpm = parsed.bpm
         self._song.meter = parsed.meter
         self._song.time_signature = parsed.meter
-        self._clock.bpm = self._song.performance_settings.bpm_override or parsed.bpm
+        if (self._bpm_source() == "CHART" or self._song.performance_settings.bpm_override or
+                not self._follow_observations_available):
+            self._clock.bpm = self._chart_bpm()
         self._clock.set_meter(self._song.performance_settings.meter_override or parsed.meter)
         self._context.bpm = self._clock.bpm
         self._context.meter = self._clock.meter
-        self._context.key = self._song.performance_settings.key_override or parsed.key
+        self._context.key = self._chart_key() if self._key_source() == "CHART" else "--"
         self._alignment = ChartAlignment(self._chart)
         self._position_estimator.set_alignment(self._alignment)
         self._position_estimator.set_capo(self._chart.capo_semitones)

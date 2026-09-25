@@ -15,6 +15,10 @@ class PerformanceSettings:
     """Configurações de performance e acompanhamento específicas da música."""
     bpm_override: Optional[float] = None
     key_override: Optional[str] = None
+    # Fontes independentes: andamento regula a grade rítmica; tom regula a
+    # interpretação tonal. Valores persistidos por música.
+    bpm_source: str = "AUDIO"       # AUDIO | CHART
+    key_source: str = "CHART"       # CHART | AUDIO
     meter_override: Optional[str] = None
     transpose_semitones: int = 0
     master_volume: float = 1.0
@@ -34,6 +38,8 @@ class PerformanceSettings:
         return {
             "bpm_override": self.bpm_override,
             "key_override": self.key_override,
+            "bpm_source": self.bpm_source,
+            "key_source": self.key_source,
             "meter_override": self.meter_override,
             "transpose_semitones": self.transpose_semitones,
             "master_volume": self.master_volume,
@@ -57,6 +63,10 @@ class PerformanceSettings:
         return cls(
             bpm_override=data.get("bpm_override"),
             key_override=data.get("key_override"),
+            bpm_source=(str(data.get("bpm_source", "AUDIO")).upper()
+                        if str(data.get("bpm_source", "AUDIO")).upper() in ("AUDIO", "CHART") else "AUDIO"),
+            key_source=(str(data.get("key_source", "CHART")).upper()
+                        if str(data.get("key_source", "CHART")).upper() in ("AUDIO", "CHART") else "CHART"),
             meter_override=data.get("meter_override"),
             transpose_semitones=int(data.get("transpose_semitones", 0)),
             master_volume=float(data.get("master_volume", 1.0)),
