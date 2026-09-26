@@ -1210,7 +1210,14 @@ class MainWindow:
         self.player.pause()
         if self.project_manager.active_session is not None:
             self.project_manager.active_session.pause()
+        self._invalidate_bass_transport()
         self._update_transport_state(PlaybackState.PAUSED)
+
+    def _invalidate_bass_transport(self) -> None:
+        """Remove notas preparadas antes de pause, seek ou restart."""
+        synth = self.analyzer.bass_player.synthesizer
+        synth.cancel_scheduled()
+        synth.stop_voices()
 
     def _on_stop(self) -> None:
         self.player.stop()
@@ -1236,6 +1243,7 @@ class MainWindow:
 
     def _on_rewind(self) -> None:
         if self._current_source is not None:
+            self._invalidate_bass_transport()
             self.player.seek(0.0)
             self.waveform_view.set_playhead_position(0.0)
             self.seek_var.set(0.0)
@@ -1254,12 +1262,14 @@ class MainWindow:
             current = self.player.get_position()
             duration = self.player.get_duration()
             target = max(0.0, min(current + delta_seconds, duration))
+            self._invalidate_bass_transport()
             self.player.seek(target)
             self.waveform_view.set_playhead_position(target)
             self.seek_var.set(target)
 
     def _on_waveform_seek(self, target_seconds: float) -> None:
         if self._current_source is not None:
+            self._invalidate_bass_transport()
             self.player.seek(target_seconds)
             self.seek_var.set(target_seconds)
             self.lbl_time_cur.config(text=self._format_time(target_seconds))
@@ -1278,6 +1288,7 @@ class MainWindow:
         self._is_user_dragging_slider = False
         target = self.seek_var.get()
         if self._current_source is not None:
+            self._invalidate_bass_transport()
             self.player.seek(target)
             self.waveform_view.set_playhead_position(target)
 
@@ -3223,7 +3234,9 @@ class MainWindow:
     def _update_playalong_hud_from_session(self, session: SongSession) -> None:
         """Atualiza os indicadores do HUD a partir do estado corrente da SongSession."""
         self.lbl_playalong_section.config(text=session.current_section)
-        self.lbl_playalong_chord.config(text=session.current_chord)
+        # O acorde exibido no Play Along é a ChartPosition destacada. Isso o
+        # mantém idêntico à fonte consumida pelo modo CHART do baixista.
+        self.lbl_playalong_chord.config(text=session.chart_position.current_chord)
         self.lbl_playalong_next_chord.config(text=session.next_chord)
         self.lbl_playalong_bar_beat.config(
             text=f"Comp. {session.current_bar}  |  Tempo {session.current_beat} / {session.clock.beats_per_bar}"

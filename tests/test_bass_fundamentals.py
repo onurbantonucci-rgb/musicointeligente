@@ -584,6 +584,30 @@ class TestBassFundamentals(unittest.TestCase):
                     self.context(chord=chord), pattern_override=BassPatternType.FUNDAMENTALS)
                 self.assertTrue(decision.root_note.startswith("D"))
 
+    def test_seek_generation_discards_old_chart_note(self):
+        bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.FUNDAMENTALS,
+                          harmony_source=BassHarmonySource.CHART)
+        context = self.context(timestamp=.25, beat=1, phase=.5, chord="C")
+        context.chart_available = True
+        context.chart_published_chord = "C"
+        context.clock_bar = context.clock_beat = 1
+        context.position_generation = 1
+        bass.on_musical_context(context)
+        self.assertTrue(bass.synthesizer.scheduled_events[0].note.startswith("C"))
+
+        # Seek para uma posição cuja cifra já mostra F: a previsão C não pode
+        # sobreviver, mesmo se a análise de áudio ainda estiver atrasada.
+        context.timestamp = 4.0
+        context.bar = context.clock_bar = 3
+        context.beat = context.clock_beat = 1
+        context.beat_position = 0.0
+        context.position_generation = 2
+        context.chart_published_chord = "F"
+        event = bass.on_musical_context(context)
+        self.assertTrue(event.note.startswith("F"))
+        self.assertTrue(all(item.note.startswith("F")
+                            for item in bass.synthesizer.scheduled_events))
+
 
 class TestBassChartModeUI(unittest.TestCase):
     def test_chart_source_is_selectable_in_bassist_tab(self):

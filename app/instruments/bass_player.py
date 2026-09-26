@@ -279,6 +279,11 @@ class BassPlayer(VirtualInstrument):
             return None
 
         chart_only = self._harmony_source == BassHarmonySource.CHART
+        # A geração identifica uma mudança de transporte (seek, restart,
+        # transposição ou nova sessão). Faça esta sincronização antes de
+        # comparar a harmonia atual: assim uma posição nova nunca herda uma
+        # nota, uma grade ou um acorde da posição anterior.
+        self._sync_position_generation(context, chart_only)
         if chart_only:
             # A mesma ChartPosition que a UI destaca manda na harmonia. Áudio
             # só continua fornecendo tempo, fase e atividade da performance.
@@ -399,15 +404,6 @@ class BassPlayer(VirtualInstrument):
                             chart_chord_changed: bool = False) -> Optional[BassNoteEvent]:
         """Agenda no sintetizador a próxima batida; nunca recupera batidas antigas."""
         chart_only = self._harmony_source == BassHarmonySource.CHART
-        if not chart_only and context.position_generation != self._generation_id:
-            self._synthesizer.set_generation(context.position_generation)
-            self._generation_id = context.position_generation
-            self._last_triggered_beat = None
-            self._last_chord = "--"
-            self._last_scheduled_time = None
-        elif chart_only and self._generation_id is None:
-            self._synthesizer.set_generation(context.position_generation)
-            self._generation_id = context.position_generation
         if self._pattern_override == BassPatternType.FUNDAMENTALS:
             return self._schedule_root_grid(context, chord_change=chart_chord_changed)
         recovering = context.performance_state == "RECOVERING"
@@ -574,6 +570,28 @@ class BassPlayer(VirtualInstrument):
         if ChartSemanticClassifier.is_chord_shaped(context.chord):
             return context.chord
         return context.chart_clock_chord
+
+    def _sync_position_generation(self, context: MusicalContext,
+                                  chart_only: bool) -> None:
+        """Invalida decisões de uma posição musical anterior uma única vez."""
+        if context.position_generation == self._generation_id:
+            return
+
+        was_initialized = self._generation_id is not None
+        self._synthesizer.set_generation(context.position_generation)
+        self._generation_id = context.position_generation
+        self._last_triggered_beat = None
+        self._last_chord = "--"
+        self._last_scheduled_time = None
+
+        if chart_only and was_initialized:
+            # Nunca deixe uma voz ou previsão da posição anterior atravessar
+            # um seek/restart. A chamada vem antes da comparação de acordes,
+            # permitindo que o novo acorde da cifra seja atacado já neste tick.
+            self._synthesizer.cancel_scheduled()
+            self._synthesizer.stop_voices()
+            self._last_chart_position_chord = "--"
+            self._chart_rhythm_anchor_grid = 0.0
 
     def _chart_root_changed(self, chord: str) -> bool:
         """Detecta uma troca real de tônica publicada pela cifra."""
