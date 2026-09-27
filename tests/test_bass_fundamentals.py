@@ -619,12 +619,13 @@ class TestBassChartModeUI(unittest.TestCase):
             root.withdraw()
             try:
                 window = MainWindow(root, project_file_path=f"{folder}/project.json")
-                self.assertEqual(window.combo_bass_harmony_source.get(),
+                # O combo e o handler agora vivem no BassPlayerPanel (app/ui/panels/).
+                self.assertEqual(window.bass_panel.combo_bass_harmony_source.get(),
                                  "Seguir sempre a cifra")
                 self.assertEqual(window.analyzer.bass_player.harmony_source,
                                  BassHarmonySource.CHART)
-                window.combo_bass_harmony_source.set("Cifra + confirmação do áudio")
-                window._on_bass_harmony_source_changed()
+                window.bass_panel.combo_bass_harmony_source.set("Cifra + confirmação do áudio")
+                window.bass_panel._on_harmony_source_changed()
                 self.assertEqual(window.analyzer.bass_player.harmony_source,
                                  BassHarmonySource.FOLLOW)
             finally:

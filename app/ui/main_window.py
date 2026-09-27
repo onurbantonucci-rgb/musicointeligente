@@ -23,14 +23,14 @@ from app.audio.audio_loader import FileAudioSource
 from app.audio.audio_player import AudioPlayer, PlaybackState
 from app.analysis.audio_analyzer import AudioAnalyzer
 from app.analysis.tempo_detector import OnsetTempoDetector
-from app.music.musical_context import MusicalContext
 from app.ui.waveform_view import WaveformView
 from app.ui.chroma_view import ChromaView
 from app.ui.edit_history import ChartEditState, EditHistory
+from app.ui.panels.bass_player_panel import BassPlayerPanel
+from app.ui.panels.structure_prediction_panel import StructurePredictionPanel
 from app.utils.audio_generator import generate_test_song, generate_acoustic_guitar_sample
 from app.utils.timing import LatencyTracker
 from app.instruments import BassPatternType, BassNoteValue, BassHarmonySource
-from app.music.theory import midi_to_hz
 from app.project.project_manager import ProjectManager, DEFAULT_PROJECT_PATH
 from app.song.song import Song
 from app.song.song_session import SongSession
@@ -43,7 +43,6 @@ from app.input.chart_sources import (
     DocxChartSource,
     ImageChartSource,
     PdfChartSource,
-    RawChartDocument
 )
 
 
@@ -51,35 +50,8 @@ from app.input.chart_sources import (
 class MainWindow:
     """Janela principal da aplicação com tema escuro e dashboard de contexto musical."""
 
-    BASS_PATTERNS = [
-        "FUNDAMENTAIS",
-        "AUTO",
-        "ROOT + FIFTH",
-        "ROOT + FIFTH + OCTAVE",
-        "SUSTAINED"
-    ]
-
-    PATTERN_MAP = {
-        "FUNDAMENTAIS": BassPatternType.FUNDAMENTALS,
-        "AUTO": BassPatternType.AUTO,
-        "ROOT": BassPatternType.ROOT,
-        "ROOT + FIFTH": BassPatternType.ROOT_FIFTH,
-        "ROOT + FIFTH + OCTAVE": BassPatternType.ROOT_FIFTH_OCTAVE,
-        "SUSTAINED": BassPatternType.SUSTAINED,
-    }
-
-    BASS_NOTE_VALUES = {
-        "Semibreve — a cada 4 tempos": BassNoteValue.WHOLE,
-        "Mínima — a cada 2 tempos": BassNoteValue.HALF,
-        "Semínima — a cada tempo": BassNoteValue.QUARTER,
-        "Colcheia — 2x por tempo": BassNoteValue.EIGHTH,
-        "Semicolcheia — 4x por tempo": BassNoteValue.SIXTEENTH,
-    }
-
-    BASS_HARMONY_SOURCES = {
-        "Seguir sempre a cifra": BassHarmonySource.CHART,
-        "Cifra + confirmação do áudio": BassHarmonySource.FOLLOW,
-    }
+    # Constantes de padrão/nota/fonte harmônica do baixo agora vivem em
+    # app/ui/panels/bass_player_panel.py (BassPlayerPanel), que é o único consumidor.
 
     ANALYSIS_CHANNELS = (
         "Automático",
@@ -131,7 +103,6 @@ class MainWindow:
         self._current_source: FileAudioSource = None
         self._recommended_analysis_channel: Optional[int] = None
         self._last_rendered_events_count = 0
-        self._last_rendered_bass_events_count = 0
         self._update_counter = 0
 
         # Configurar Estilos TTK
@@ -163,11 +134,7 @@ class MainWindow:
 
         bg_dark = "#11141a"
         card_bg = "#181d26"
-        card_border = "#262f3e"
         text_primary = "#f0f4f8"
-        text_secondary = "#8c9ba5"
-        accent_blue = "#00b4d8"
-        accent_green = "#00e676"
 
         self.style.configure(".", background=bg_dark, foreground=text_primary, font=("Segoe UI", 9))
         self.style.configure("TFrame", background=bg_dark)
@@ -655,15 +622,20 @@ class MainWindow:
         self._build_waveform_section(self.audio_lab_tab)
         self._build_analysis_dashboard(self.audio_lab_tab)
 
-        # Aba 3: Baixista Virtual (v0.2)
+        # Aba 3: Baixista Virtual (v0.2) — painel próprio (app/ui/panels/bass_player_panel.py)
         self.bass_tab = tk.Frame(self.main_notebook, bg="#181d26")
         self.main_notebook.add(self.bass_tab, text="  🎸 Baixista Virtual (BassPlayer)  ")
-        self._build_bass_player_content(self.bass_tab)
+        self.bass_panel = BassPlayerPanel(
+            self.bass_tab, self.analyzer,
+            status_callback=lambda msg: self.lbl_status_msg.config(text=msg))
 
-        # Aba 4: Estrutura Musical & Predição (v0.3)
+        # Aba 4: Estrutura Musical & Predição (v0.3) — painel próprio
+        # (app/ui/panels/structure_prediction_panel.py)
         self.structure_tab = tk.Frame(self.main_notebook, bg="#181d26")
         self.main_notebook.add(self.structure_tab, text="  🏛️ Estrutura & Previsão  ")
-        self._build_structure_prediction_content(self.structure_tab)
+        self.structure_panel = StructurePredictionPanel(
+            self.structure_tab, self.analyzer,
+            status_callback=lambda msg: self.lbl_status_msg.config(text=msg))
 
         # Seleciona Play-Along como aba inicial ativa
         self.main_notebook.select(self.playalong_tab)
@@ -671,369 +643,6 @@ class MainWindow:
     # Método de compatibilidade
     def _build_bottom_tabs_section(self) -> None:
         pass
-
-    def _build_bass_player_content(self, parent: tk.Frame) -> None:
-        """Painel de Controle e Visualização do Baixista Virtual (v0.2)."""
-        self.bass_container = tk.Frame(parent, bg="#181d26", bd=0, padx=8, pady=4)
-        self.bass_container.pack(fill="both", expand=True)
-
-        # -------------------------------------------------------------
-        # 1. Barra Superior de Controles do Baixo
-        # -------------------------------------------------------------
-        ctrl_bar = tk.Frame(self.bass_container, bg="#181d26")
-        ctrl_bar.pack(fill="x", pady=(0, 4))
-
-        # Título
-        lbl_bass_title = tk.Label(
-            ctrl_bar,
-            text="🎸 BAIXISTA VIRTUAL (BASSPLAYER)",
-            bg="#181d26",
-            fg="#00e676",
-            font=("Segoe UI", 9, "bold")
-        )
-        lbl_bass_title.pack(side="left", padx=(0, 10))
-
-        # Botão Toggle Ativo / Silenciado
-        self.btn_bass_toggle = tk.Button(
-            ctrl_bar,
-            text="🎸 BAIXO: ATIVADO",
-            bg="#0f3424",
-            fg="#00e676",
-            activebackground="#144d34",
-            activeforeground="#00e676",
-            font=("Segoe UI", 8, "bold"),
-            relief="flat",
-            padx=8,
-            pady=2,
-            cursor="hand2",
-            command=self._toggle_bass
-        )
-        self.btn_bass_toggle.pack(side="left", padx=(0, 14))
-
-        # Seletor de Padrão
-        tk.Label(ctrl_bar, text="Padrão:", bg="#181d26", fg="#8c9ba5",
-                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 4))
-
-        self.combo_bass_pattern = ttk.Combobox(
-            ctrl_bar,
-            values=self.BASS_PATTERNS,
-            state="readonly",
-            width=22,
-            font=("Segoe UI", 8)
-        )
-        self.combo_bass_pattern.set("FUNDAMENTAIS")
-        self.combo_bass_pattern.pack(side="left", padx=(0, 14))
-        self.combo_bass_pattern.bind("<<ComboboxSelected>>", self._on_bass_pattern_changed)
-
-        # Slider de Volume do Baixo
-        tk.Label(ctrl_bar, text="Volume Baixo:", bg="#181d26", fg="#8c9ba5",
-                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 4))
-
-        self.bass_vol_var = tk.DoubleVar(value=85.0)
-        self.scale_bass_vol = ttk.Scale(
-            ctrl_bar,
-            from_=0.0,
-            to=100.0,
-            orient="horizontal",
-            variable=self.bass_vol_var,
-            command=self._on_bass_volume_changed,
-            length=100
-        )
-        self.scale_bass_vol.pack(side="left", padx=(0, 6))
-
-        self.lbl_bass_vol_val = tk.Label(ctrl_bar, text="85%", bg="#181d26", fg="#00d2ff",
-                                         font=("Consolas", 8, "bold"), width=4)
-        self.lbl_bass_vol_val.pack(side="left", padx=(0, 10))
-
-        # Botão Modo Debug / Histórico de Decisões
-        self.btn_bass_debug_toggle = tk.Button(
-            ctrl_bar,
-            text="📋 Log de Decisões (Debug) ▼",
-            bg="#212836",
-            fg="#f0f4f8",
-            activebackground="#2c3649",
-            activeforeground="#ffffff",
-            font=("Segoe UI", 8),
-            relief="flat",
-            padx=8,
-            pady=2,
-            cursor="hand2",
-            command=self._toggle_bass_debug
-        )
-        self.btn_bass_debug_toggle.pack(side="right")
-
-        rhythm_bar = tk.Frame(self.bass_container, bg="#181d26")
-        rhythm_bar.pack(fill="x", pady=(0, 5))
-        tk.Label(rhythm_bar, text="Fonte das notas:", bg="#181d26", fg="#8c9ba5",
-                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 6))
-        self.combo_bass_harmony_source = ttk.Combobox(
-            rhythm_bar, values=list(self.BASS_HARMONY_SOURCES), state="readonly",
-            width=27, font=("Segoe UI", 8))
-        self.combo_bass_harmony_source.set("Seguir sempre a cifra")
-        self.combo_bass_harmony_source.pack(side="left", padx=(0, 12))
-        self.combo_bass_harmony_source.bind("<<ComboboxSelected>>", self._on_bass_harmony_source_changed)
-        tk.Label(rhythm_bar, text="Repetição da tônica:", bg="#181d26", fg="#8c9ba5",
-                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 6))
-        self.combo_bass_note_value = ttk.Combobox(
-            rhythm_bar, values=list(self.BASS_NOTE_VALUES), state="readonly",
-            width=29, font=("Segoe UI", 8))
-        self.combo_bass_note_value.set("Mínima — a cada 2 tempos")
-        self.combo_bass_note_value.pack(side="left", padx=(0, 12))
-        self.combo_bass_note_value.bind("<<ComboboxSelected>>", self._on_bass_note_value_changed)
-        tk.Label(rhythm_bar, text="O BPM e a batida do músico definem os instantes.",
-                 bg="#181d26", fg="#8c9ba5", font=("Segoe UI", 8)).pack(side="left")
-
-        # -------------------------------------------------------------
-        # 2. Quatro Cartões de Métricas do Baixista
-        # -------------------------------------------------------------
-        cards_frame = tk.Frame(self.bass_container, bg="#181d26")
-        cards_frame.pack(fill="x", pady=2)
-        cards_frame.columnconfigure((0, 1, 2, 3), weight=1, uniform="bass_cards")
-
-        # Card 1: Nota Atual Tocada pelo Baixo
-        c1 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
-        c1.grid(row=0, column=0, sticky="nsew", padx=2)
-        tk.Label(c1, text="NOTA SOANDO DO BAIXO", bg="#141820", fg="#00e676", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_bass_note = tk.Label(c1, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 18, "bold"))
-        self.lbl_bass_note.pack()
-        self.lbl_bass_freq = tk.Label(c1, text="MIDI --  |  -- Hz", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
-        self.lbl_bass_freq.pack()
-
-        # Card 2: Motivo da Escolha (Fundamental, 5ª, 8ª, Inversão)
-        c2 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
-        c2.grid(row=0, column=1, sticky="nsew", padx=2)
-        tk.Label(c2, text="ORIGEM / TEMPO", bg="#141820", fg="#00d2ff", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_bass_reason = tk.Label(c2, text="Aguardando compasso...", bg="#141820", fg="#5a6677", font=("Segoe UI", 10, "bold"))
-        self.lbl_bass_reason.pack(pady=2)
-        self.lbl_bass_voice_leading = tk.Label(c2, text="Condução harmônica inteligente", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
-        self.lbl_bass_voice_leading.pack()
-        self.lbl_bass_chart_source = tk.Label(c2, text="Cifra agora: --  |  Fonte: --",
-                                               bg="#141820", fg="#8c9ba5",
-                                               font=("Segoe UI", 7))
-        self.lbl_bass_chart_source.pack()
-
-        # Card 3: Padrão em Execução
-        c3 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
-        c3.grid(row=0, column=2, sticky="nsew", padx=2)
-        tk.Label(c3, text="PADRÃO EM EXECUÇÃO", bg="#141820", fg="#00d2ff", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_bass_pattern_active = tk.Label(c3, text="FUNDAMENTAIS", bg="#141820", fg="#ffffff", font=("Segoe UI", 11, "bold"))
-        self.lbl_bass_pattern_active.pack(pady=2)
-        self.lbl_bass_sub_pattern = tk.Label(c3, text="Adaptativo às mudanças", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
-        self.lbl_bass_sub_pattern.pack()
-
-        # Card 4: Próxima Nota Prevista
-        c4 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
-        c4.grid(row=0, column=3, sticky="nsew", padx=2)
-        tk.Label(c4, text="PRÓXIMA NOTA PREVISTA", bg="#141820", fg="#ffd166", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_bass_next_note = tk.Label(c4, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 11, "bold"))
-        self.lbl_bass_next_note.pack(pady=2)
-        self.lbl_bass_next_timing = tk.Label(c4, text="Aguardando harmonia", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
-        self.lbl_bass_next_timing.pack()
-
-        # -------------------------------------------------------------
-        # 3. Painel de Debug (Tabela de Decisões do Baixista)
-        # -------------------------------------------------------------
-        self.frame_bass_debug = tk.Frame(self.bass_container, bg="#141820", bd=1, relief="solid")
-        self.frame_bass_debug.pack(fill="x", pady=(4, 0))
-        self._bass_debug_visible = True
-
-        debug_cols = ("bar", "beat", "chord", "note", "midi", "pattern", "reason")
-        self.tree_bass_debug = ttk.Treeview(self.frame_bass_debug, columns=debug_cols, show="headings",
-                                            height=3, selectmode="none")
-
-        self.tree_bass_debug.heading("bar", text="COMPASSO")
-        self.tree_bass_debug.heading("beat", text="TEMPO")
-        self.tree_bass_debug.heading("chord", text="ACORDE")
-        self.tree_bass_debug.heading("note", text="NOTA BAIXO")
-        self.tree_bass_debug.heading("midi", text="MIDI / HZ")
-        self.tree_bass_debug.heading("pattern", text="PADRÃO")
-        self.tree_bass_debug.heading("reason", text="MOTIVO HARMÔNICO")
-
-        self.tree_bass_debug.column("bar", width=75, anchor="center")
-        self.tree_bass_debug.column("beat", width=65, anchor="center")
-        self.tree_bass_debug.column("chord", width=75, anchor="center")
-        self.tree_bass_debug.column("note", width=85, anchor="center")
-        self.tree_bass_debug.column("midi", width=105, anchor="center")
-        self.tree_bass_debug.column("pattern", width=120, anchor="center")
-        self.tree_bass_debug.column("reason", width=260, anchor="w")
-
-        debug_scroll = ttk.Scrollbar(self.frame_bass_debug, orient="vertical", command=self.tree_bass_debug.yview)
-        self.tree_bass_debug.configure(yscrollcommand=debug_scroll.set)
-
-        self.tree_bass_debug.pack(side="left", fill="both", expand=True)
-        debug_scroll.pack(side="right", fill="y")
-
-    def _build_structure_prediction_content(self, parent: tk.Frame) -> None:
-        """Conteúdo da aba Estrutura & Previsão (v0.3)."""
-        container = tk.Frame(parent, bg="#181d26", padx=8, pady=4)
-        container.pack(fill="both", expand=True)
-
-        # 1. Barra superior: Título e Botão de Exportar
-        top_bar = tk.Frame(container, bg="#181d26")
-        top_bar.pack(fill="x", pady=(0, 4))
-
-        tk.Label(
-            top_bar,
-            text="🏛️ ESTRUTURA MUSICAL, MEMÓRIA DE PADRÕES & PREDIÇÃO ANTECIPADA (v0.3)",
-            bg="#181d26",
-            fg="#00d2ff",
-            font=("Segoe UI", 9, "bold")
-        ).pack(side="left")
-
-        self.btn_export_report = tk.Button(
-            top_bar,
-            text="💾 Exportar Relatório JSON (Report)",
-            bg="#0077b6",
-            fg="#ffffff",
-            activebackground="#0096c7",
-            activeforeground="#ffffff",
-            font=("Segoe UI", 8, "bold"),
-            relief="flat",
-            padx=10,
-            pady=2,
-            cursor="hand2",
-            command=self._on_export_structure_report
-        )
-        self.btn_export_report.pack(side="right")
-
-        # 2. Quatro Cartões de Resumo
-        cards_frame = tk.Frame(container, bg="#181d26")
-        cards_frame.pack(fill="x", pady=2)
-        cards_frame.columnconfigure((0, 1, 2, 3), weight=1, uniform="struct_cards")
-
-        # Card 1: Seção Atual & Padrão
-        sc1 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=6, pady=3)
-        sc1.grid(row=0, column=0, sticky="nsew", padx=2)
-        tk.Label(sc1, text="SEÇÃO ATUAL & PADRÃO", bg="#141820", fg="#00d2ff", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_struct_cur_section = tk.Label(sc1, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 16, "bold"))
-        self.lbl_struct_cur_section.pack(pady=1)
-        self.lbl_struct_progress = tk.Label(sc1, text="Progresso: --%  |  Comp. --", bg="#141820", fg="#00e676", font=("Segoe UI", 8))
-        self.lbl_struct_progress.pack()
-
-        # Card 2: Próxima Seção Prevista
-        sc2 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=6, pady=3)
-        sc2.grid(row=0, column=1, sticky="nsew", padx=2)
-        tk.Label(sc2, text="PRÓXIMA SEÇÃO (PREVISTA)", bg="#141820", fg="#ffd166", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_pred_next_section = tk.Label(sc2, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 16, "bold"))
-        self.lbl_pred_next_section.pack(pady=1)
-        self.lbl_pred_timing = tk.Label(sc2, text="Em -- compassos", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 8))
-        self.lbl_pred_timing.pack()
-
-        # Card 3: Look-ahead Harmônico (Próximos Acordes)
-        sc3 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=6, pady=3)
-        sc3.grid(row=0, column=2, sticky="nsew", padx=2)
-        tk.Label(sc3, text="LOOK-AHEAD HARMÔNICO (1-4C)", bg="#141820", fg="#00e676", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_pred_lookahead = tk.Label(sc3, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 13, "bold"))
-        self.lbl_pred_lookahead.pack(pady=2)
-        self.lbl_pred_reason = tk.Label(sc3, text="Aguardando harmonia", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
-        self.lbl_pred_reason.pack()
-
-        # Card 4: Forma Global da Música
-        sc4 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=6, pady=3)
-        sc4.grid(row=0, column=3, sticky="nsew", padx=2)
-        tk.Label(sc4, text="FORMA GLOBAL DA MÚSICA", bg="#141820", fg="#c77dff", font=("Segoe UI", 7, "bold")).pack(anchor="w")
-        self.lbl_struct_form = tk.Label(sc4, text="--", bg="#141820", fg="#5a6677", font=("Segoe UI", 14, "bold"))
-        self.lbl_struct_form.pack(pady=1)
-        self.lbl_struct_summary = tk.Label(sc4, text="0 seções  |  0 padrões", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
-        self.lbl_struct_summary.pack()
-
-        # 3. Tabelas Lado a Lado: Padrões Conhecidos & Matriz de Transições
-        tables_frame = tk.Frame(container, bg="#181d26")
-        tables_frame.pack(fill="both", expand=True, pady=(3, 0))
-        tables_frame.columnconfigure((0, 1), weight=1, uniform="struct_tables")
-
-        # Tabela 1 (Esquerda): Padrões Conhecidos
-        left_tbl = tk.Frame(tables_frame, bg="#141820", bd=1, relief="solid", padx=4, pady=3)
-        left_tbl.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        tk.Label(left_tbl, text="PADRÕES CONHECIDOS (PATTERN MEMORY)", bg="#141820", fg="#00d2ff",
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(0, 2))
-
-        pat_cols = ("id", "signature", "bars", "occurrences", "stability")
-        self.tree_patterns = ttk.Treeview(left_tbl, columns=pat_cols, show="headings", height=3, selectmode="none")
-        self.tree_patterns.heading("id", text="ID")
-        self.tree_patterns.heading("signature", text="ASSINATURA DE ACORDES")
-        self.tree_patterns.heading("bars", text="COMP.")
-        self.tree_patterns.heading("occurrences", text="OCORR.")
-        self.tree_patterns.heading("stability", text="ESTAB.")
-        self.tree_patterns.column("id", width=45, anchor="center")
-        self.tree_patterns.column("signature", width=200, anchor="w")
-        self.tree_patterns.column("bars", width=45, anchor="center")
-        self.tree_patterns.column("occurrences", width=50, anchor="center")
-        self.tree_patterns.column("stability", width=55, anchor="center")
-
-        pat_scroll = ttk.Scrollbar(left_tbl, orient="vertical", command=self.tree_patterns.yview)
-        self.tree_patterns.configure(yscrollcommand=pat_scroll.set)
-        self.tree_patterns.pack(side="left", fill="both", expand=True)
-        pat_scroll.pack(side="right", fill="y")
-
-        # Tabela 2 (Direita): Transições entre Seções
-        right_tbl = tk.Frame(tables_frame, bg="#141820", bd=1, relief="solid", padx=4, pady=3)
-        right_tbl.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
-        tk.Label(right_tbl, text="MATRIZ DE TRANSIÇÃO ENTRE SEÇÕES P(B|A)", bg="#141820", fg="#ffd166",
-                 font=("Segoe UI", 7, "bold")).pack(anchor="w", pady=(0, 2))
-
-        trans_cols = ("from_sec", "to_sec", "transition", "prob", "count")
-        self.tree_transitions = ttk.Treeview(right_tbl, columns=trans_cols, show="headings", height=3, selectmode="none")
-        self.tree_transitions.heading("from_sec", text="DE")
-        self.tree_transitions.heading("to_sec", text="PARA")
-        self.tree_transitions.heading("transition", text="PADRÃO (ORIGEM → DESTINO)")
-        self.tree_transitions.heading("prob", text="PROBAB.")
-        self.tree_transitions.heading("count", text="QTD")
-        self.tree_transitions.column("from_sec", width=75, anchor="center")
-        self.tree_transitions.column("to_sec", width=75, anchor="center")
-        self.tree_transitions.column("transition", width=160, anchor="center")
-        self.tree_transitions.column("prob", width=65, anchor="center")
-        self.tree_transitions.column("count", width=45, anchor="center")
-
-        trans_scroll = ttk.Scrollbar(right_tbl, orient="vertical", command=self.tree_transitions.yview)
-        self.tree_transitions.configure(yscrollcommand=trans_scroll.set)
-        self.tree_transitions.pack(side="left", fill="both", expand=True)
-        trans_scroll.pack(side="right", fill="y")
-
-    def _on_export_structure_report(self) -> None:
-        """Salva o relatório estrutural JSON completo da música."""
-        try:
-            filepath = filedialog.asksaveasfilename(
-                title="Exportar Relatório de Estrutura Musical (JSON)",
-                defaultextension=".json",
-                initialfile="music_structure_report.json",
-                filetypes=[("Arquivos JSON (*.json)", "*.json"), ("Todos os Arquivos (*.*)", "*.*")]
-            )
-            if filepath:
-                self.analyzer.export_structure_report(filepath)
-                messagebox.showinfo(
-                    "Exportação Concluída",
-                    f"Relatório de estrutura exportado com sucesso para:\n{filepath}"
-                )
-                self.lbl_status_msg.config(text=f"Relatório exportado: {os.path.basename(filepath)}")
-        except Exception as e:
-            messagebox.showerror("Erro ao Exportar Relatório", f"Falha ao salvar relatório JSON:\n{e}")
-
-    def _refresh_structure_tables(self) -> None:
-        """Atualiza tabelas de padrões conhecidos e matriz de transições."""
-        # 1. Padrões
-        patterns = self.analyzer.pattern_memory.get_known_patterns()
-        self.tree_patterns.delete(*self.tree_patterns.get_children())
-        for pat in patterns:
-            sig_txt = " - ".join(pat.chord_signatures[:6])
-            if len(pat.chord_signatures) > 6:
-                sig_txt += "..."
-            stab_txt = f"{int(pat.stability_score * 100)}%"
-            self.tree_patterns.insert(
-                "", "end",
-                values=(pat.id, sig_txt, pat.duration_bars, pat.occurrence_count, stab_txt)
-            )
-
-        # 2. Transições
-        transitions = self.analyzer.pattern_memory.get_transitions()
-        self.tree_transitions.delete(*self.tree_transitions.get_children())
-        for tr in transitions:
-            prob_txt = f"{tr.probability * 100:.0f}%"
-            self.tree_transitions.insert(
-                "", "end",
-                values=(tr.from_section, tr.to_section, f"{tr.from_pattern_id} → {tr.to_pattern_id}", prob_txt, tr.count)
-            )
-
 
     def _build_statusbar(self) -> None:
         """Barra de status inferior."""
@@ -1122,14 +731,8 @@ class MainWindow:
                 self.tree_history.delete(item)
             self._last_rendered_events_count = 0
 
-            for item in self.tree_bass_debug.get_children():
-                self.tree_bass_debug.delete(item)
-            self._last_rendered_bass_events_count = 0
-
-            for item in self.tree_patterns.get_children():
-                self.tree_patterns.delete(item)
-            for item in self.tree_transitions.get_children():
-                self.tree_transitions.delete(item)
+            self.bass_panel.reset_debug_table()
+            self.structure_panel.reset_tables()
             self._draw_structure_timeline(0.0, 0.0)
 
             # Atualizar Metadados
@@ -1443,97 +1046,14 @@ class MainWindow:
                     if self._update_counter % 6 == 0:
                         self._refresh_chord_history_table()
 
-                    # 9. Baixista Virtual (v0.2)
-                    bass = self.analyzer.bass_player
-                    cur_ev = bass.current_event
-                    cur_dec = bass.current_decision
-                    playing = bass.synthesizer.playing_event
-
-                    if bass.enabled:
-                        pat_name = ("FUNDAMENTAIS" if bass.pattern == BassPatternType.FUNDAMENTALS else
-                                    cur_dec.pattern_type.value.upper() if cur_dec else bass.pattern.value.upper())
-                        self.lbl_bass_pattern_active.config(text=pat_name, fg="#00d2ff")
-                        self.lbl_bass_sub_pattern.config(text=self.combo_bass_note_value.get())
-                        chart_now = getattr(ctx, "chart_published_chord", "--")
-                        source_name = "Cifra" if bass.harmony_source == BassHarmonySource.CHART else "Cifra + áudio"
-                        self.lbl_bass_chart_source.config(
-                            text=f"Cifra agora: {chart_now}  |  Fonte: {source_name}",
-                            fg="#00e676" if bass.harmony_source == BassHarmonySource.CHART else "#8c9ba5")
-                        if playing is not None:
-                            self.lbl_bass_note.config(text=playing.note, fg="#00e676")
-                            freq = midi_to_hz(playing.midi_note)
-                            self.lbl_bass_freq.config(
-                                text=f"MIDI {playing.midi_note}  |  {freq:.1f} Hz  |  Vel: {playing.velocity}")
-                            delay = bass.synthesizer.last_render_delay_ms
-                            self.lbl_bass_reason.config(
-                                text=f"Soando agora · {playing.source} · atraso {delay:.0f} ms",
-                                fg="#ffffff")
-                        else:
-                            self.lbl_bass_note.config(text="--", fg="#5a6677")
-                            self.lbl_bass_freq.config(text="Aguardando próximo ataque")
-                            self.lbl_bass_reason.config(text="Baixo em silêncio", fg="#8c9ba5")
-                        prepared = bass.synthesizer.scheduled_events
-                        if prepared:
-                            self.lbl_bass_next_note.config(text=prepared[0].note, fg="#ffd166")
-                            self.lbl_bass_next_timing.config(
-                                text=f"Agendada para {prepared[0].scheduled_time:.2f} s", fg="#8c9ba5")
-                        else:
-                            self.lbl_bass_next_note.config(text="--", fg="#5a6677")
-                            self.lbl_bass_next_timing.config(text="Aguardando próximo ataque", fg="#8c9ba5")
-                    elif not bass.enabled:
-                        self.lbl_bass_note.config(text="MUTED", fg="#ff5252")
-                        self.lbl_bass_freq.config(text="Sintetizador desativado")
-                        self.lbl_bass_reason.config(text="Baixista silenciado pelo usuário", fg="#8c9ba5")
-                        self.lbl_bass_next_note.config(text="--", fg="#5a6677")
-                        self.lbl_bass_next_timing.config(text="Silenciado", fg="#5a6677")
-
+                    # 9. Baixista Virtual (v0.2) — delegado ao painel próprio
+                    self.bass_panel.update(ctx)
                     if self._update_counter % 6 == 0:
-                        self._refresh_bass_debug_table()
+                        self.bass_panel.refresh_debug_table()
 
-                    # 10. Estrutura Musical & Predição Antecipada (v0.3)
-                    cur_sec = ctx.current_section
-                    if cur_sec != "UNKNOWN" or ctx.current_pattern != "--":
-                        sec_disp = f"{cur_sec} ({ctx.current_pattern})" if ctx.current_pattern != "--" else cur_sec
-                        self.lbl_struct_cur_section.config(text=sec_disp, fg="#00e676")
-                        prog_pct = int(ctx.section_progress * 100)
-                        self.lbl_struct_progress.config(
-                            text=f"Progresso: {prog_pct}%  |  Comp. {ctx.bar}  |  Conf: {int(ctx.structure_confidence * 100)}%",
-                            fg="#ffffff"
-                        )
-                    else:
-                        self.lbl_struct_cur_section.config(text="--", fg="#5a6677")
-                        self.lbl_struct_progress.config(text="Progresso: --%  |  Comp. --", fg="#5a6677")
-
-                    if ctx.predicted_next_section not in ("UNKNOWN", "--"):
-                        self.lbl_pred_next_section.config(text=ctx.predicted_next_section, fg="#ffd166")
-                        self.lbl_pred_timing.config(
-                            text=f"Em {ctx.bars_until_change} compasso(s) ({ctx.beats_until_change} tempos)  |  Conf: {int(ctx.prediction_confidence * 100)}%",
-                            fg="#ffffff"
-                        )
-                    else:
-                        self.lbl_pred_next_section.config(text="--", fg="#5a6677")
-                        self.lbl_pred_timing.config(text="Sem transição prevista", fg="#5a6677")
-
-                    if ctx.predicted_next_chords:
-                        look_txt = " → ".join(ctx.predicted_next_chords[:4])
-                        self.lbl_pred_lookahead.config(text=look_txt, fg="#00d2ff")
-                        self.lbl_pred_reason.config(text=ctx.prediction_reason, fg="#8c9ba5")
-                    else:
-                        self.lbl_pred_lookahead.config(text="--", fg="#5a6677")
-                        self.lbl_pred_reason.config(text="Aguardando harmonia", fg="#5a6677")
-
-                    struct = self.analyzer.structure_analyzer.structure
-                    if struct.abstract_sequence:
-                        self.lbl_struct_form.config(text=" - ".join(struct.abstract_sequence), fg="#c77dff")
-                        self.lbl_struct_summary.config(
-                            text=f"{len(struct.sections)} seções  |  {len(struct.patterns)} padrões",
-                            fg="#ffffff"
-                        )
-                    else:
-                        self.lbl_struct_form.config(text="--", fg="#5a6677")
-                        self.lbl_struct_summary.config(text="0 seções  |  0 padrões", fg="#5a6677")
-
-                    # Atualizar Timeline Estrutural Dinâmica
+                    # 10. Estrutura Musical & Predição Antecipada (v0.3) — painel próprio;
+                    # a timeline colorida fica aqui pois desenha num canvas de outra aba.
+                    self.structure_panel.update(ctx)
                     total_dur = self._current_source.get_duration() if self._current_source else 0.0
                     self._draw_structure_timeline(pos, total_dur)
 
@@ -1572,19 +1092,8 @@ class MainWindow:
                     self.lbl_chord_duration.config(text="Tempo no acorde: 0.00 s", fg="#5a6677")
                     self.lbl_beat_leds.config(text="○   ○   ○   ○", fg="#5a6677")
                     self.lbl_sub_beat.config(text="Tempo: -- / 4", fg="#5a6677")
-                    self.lbl_bass_note.config(text="--", fg="#5a6677")
-                    self.lbl_bass_freq.config(text="MIDI --  |  -- Hz", fg="#5a6677")
-                    self.lbl_bass_reason.config(text="Aguardando reprodução...", fg="#5a6677")
-                    self.lbl_bass_next_note.config(text="--", fg="#5a6677")
-                    self.lbl_bass_next_timing.config(text="Aguardando harmonia", fg="#5a6677")
-                    self.lbl_struct_cur_section.config(text="--", fg="#5a6677")
-                    self.lbl_struct_progress.config(text="Progresso: --%  |  Comp. --", fg="#5a6677")
-                    self.lbl_pred_next_section.config(text="--", fg="#5a6677")
-                    self.lbl_pred_timing.config(text="Em -- compassos", fg="#5a6677")
-                    self.lbl_pred_lookahead.config(text="--", fg="#5a6677")
-                    self.lbl_pred_reason.config(text="Aguardando harmonia", fg="#5a6677")
-                    self.lbl_struct_form.config(text="--", fg="#5a6677")
-                    self.lbl_struct_summary.config(text="0 seções  |  0 padrões", fg="#5a6677")
+                    self.bass_panel.reset_display()
+                    self.structure_panel.reset_display()
                     self.chroma_view.clear()
                     total_dur = self._current_source.get_duration() if self._current_source else 0.0
                     self._draw_structure_timeline(0.0, total_dur)
@@ -1693,95 +1202,6 @@ class MainWindow:
         m = int(seconds // 60)
         s = int(seconds % 60)
         return f"{m:02d}:{s:02d}"
-
-    def _toggle_bass(self) -> None:
-        new_state = not self.analyzer.bass_player.enabled
-        self.analyzer.bass_player.enabled = new_state
-        if new_state:
-            self.btn_bass_toggle.config(
-                text="🎸 BAIXO: ATIVADO",
-                bg="#0f3424",
-                fg="#00e676",
-                activebackground="#144d34",
-                activeforeground="#00e676"
-            )
-            self.lbl_status_msg.config(text="Baixista Virtual ATIVADO e acompanhando a harmonia.")
-        else:
-            self.btn_bass_toggle.config(
-                text="🔇 BAIXO: SILENCIADO",
-                bg="#341818",
-                fg="#ff5252",
-                activebackground="#4a2222",
-                activeforeground="#ff5252"
-            )
-            self.lbl_status_msg.config(text="Baixista Virtual SILENCIADO.")
-
-    def _on_bass_pattern_changed(self, event=None) -> None:
-        val = self.combo_bass_pattern.get()
-        p = self.PATTERN_MAP.get(val, BassPatternType.AUTO)
-        self.analyzer.bass_player.pattern = p
-        self.lbl_status_msg.config(text=f"Padrão rítmico do baixo alterado para: {val}")
-
-    def _on_bass_note_value_changed(self, event=None) -> None:
-        label = self.combo_bass_note_value.get()
-        self.analyzer.bass_player.note_value = self.BASS_NOTE_VALUES[label]
-        self.lbl_status_msg.config(text=f"Repetição da tônica: {label}")
-
-    def _on_bass_harmony_source_changed(self, event=None) -> None:
-        label = self.combo_bass_harmony_source.get()
-        self.analyzer.bass_player.harmony_source = self.BASS_HARMONY_SOURCES[label]
-        self.lbl_status_msg.config(text=f"Fonte das notas do baixo: {label}")
-
-    def _on_bass_volume_changed(self, val) -> None:
-        try:
-            vol_val = float(val)
-            self.analyzer.bass_player.volume = vol_val / 100.0
-            self.lbl_bass_vol_val.config(text=f"{int(vol_val)}%")
-        except ValueError:
-            pass
-
-    def _toggle_bass_debug(self) -> None:
-        if self._bass_debug_visible:
-            self.frame_bass_debug.pack_forget()
-            self._bass_debug_visible = False
-            self.btn_bass_debug_toggle.config(text="📋 Log de Decisões (Debug) ▶")
-        else:
-            self.frame_bass_debug.pack(fill="x", pady=(4, 0))
-            self._bass_debug_visible = True
-            self.btn_bass_debug_toggle.config(text="📋 Log de Decisões (Debug) ▼")
-
-    def _refresh_bass_debug_table(self) -> None:
-        """Atualiza a tabela gráfica com os eventos do Baixista Virtual."""
-        events = self.analyzer.bass_player.get_recent_events()
-        children = self.tree_bass_debug.get_children()
-        rendered_count = len(children)
-        total_count = len(events)
-
-        if total_count < rendered_count:
-            for item in children:
-                self.tree_bass_debug.delete(item)
-            rendered_count = 0
-
-        if total_count > rendered_count:
-            for i in range(rendered_count, total_count):
-                ev = events[i]
-                freq = midi_to_hz(ev.midi_note) if ev.midi_note > 0 else 0.0
-                chord_txt = self.analyzer.context.chord if self.analyzer.context.chord != "--" else "--"
-                self.tree_bass_debug.insert("", "end", values=(
-                    f"#{ev.bar}",
-                    f"{ev.beat} / 4",
-                    chord_txt,
-                    ev.note,
-                    f"{ev.midi_note} ({freq:.1f}Hz)",
-                    self.analyzer.bass_player.pattern.value.upper(),
-                    ev.reason
-                ))
-
-            updated_children = self.tree_bass_debug.get_children()
-            if updated_children:
-                self.tree_bass_debug.see(updated_children[-1])
-
-            self._last_rendered_bass_events_count = total_count
 
     # ============================================================
     # Músico Play-Along, Setlist & Cancioneiro de Cifras (v0.4)
@@ -2362,7 +1782,7 @@ class MainWindow:
         self.lbl_time_cur.config(text="00:00")
         self.lbl_time_total.config(text="00:00")
         self._update_transport_state(PlaybackState.STOPPED)
-        session = self.project_manager.open_song(song)
+        self.project_manager.open_song(song)
         self._sync_reference_sources(song)
 
         if song.audio_path and os.path.exists(song.audio_path):
