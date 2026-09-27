@@ -108,14 +108,35 @@ class OnsetTempoDetector(TempoDetector):
 
             # Extrair envelope de onset e calcular BPM e frames de batidas
             tempo, beat_frames = librosa.beat.beat_track(y=decimated_audio, sr=eff_sr)
-            self._bpm = float(np.mean(tempo))
             self._beat_times = librosa.frames_to_time(beat_frames, sr=eff_sr).astype(np.float32)
+            # O tempo do librosa é quantizado na grade do tempograma (ex.: 117.45 em vez
+            # de 120). As posições das batidas são bem mais precisas: a inclinação da
+            # regressão tempo-de-batida × índice dá o período real e elimina a deriva.
+            self._bpm = self._refine_bpm(self._beat_times, float(np.mean(tempo)))
             self._last_beat_idx = -1
             print(f"[TempoDetector] BPM detectado: {self._bpm:.1f} | Total de batidas: {len(self._beat_times)}")
             return self._bpm
         except Exception as e:
             print(f"[TempoDetector] Erro ao detectar tempo: {e}")
             return self._analyze_audio_fallback(audio_data, sample_rate)
+
+    @staticmethod
+    def _refine_bpm(beat_times: np.ndarray, coarse_bpm: float) -> float:
+        """Refina o BPM pela regressão linear das batidas, com fallback no valor bruto.
+
+        Só aceita o refinamento se ficar perto do valor bruto (±8%): protege contra
+        grades de batida irregulares (rubato, falhas) que distorceriam a inclinação.
+        """
+        if len(beat_times) < 8 or coarse_bpm <= 0:
+            return coarse_bpm
+        idx = np.arange(len(beat_times), dtype=np.float64)
+        slope, _ = np.polyfit(idx, beat_times.astype(np.float64), 1)
+        if slope <= 0:
+            return coarse_bpm
+        refined = 60.0 / slope
+        if abs(refined - coarse_bpm) / coarse_bpm > 0.08:
+            return coarse_bpm
+        return float(refined)
 
     def _analyze_audio_fallback(self, audio_data: np.ndarray, sample_rate: int) -> float:
         """Rastreador NumPy usado quando a biblioteca principal não está disponível."""

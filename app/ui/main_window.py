@@ -16,7 +16,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from typing import Optional
+from typing import Any, Optional
 import numpy as np
 
 from app.audio.audio_loader import FileAudioSource
@@ -33,6 +33,7 @@ from app.instruments import BassPatternType, BassNoteValue, BassHarmonySource
 from app.music.theory import midi_to_hz
 from app.project.project_manager import ProjectManager, DEFAULT_PROJECT_PATH
 from app.song.song import Song
+from app.song.song_session import SongSession
 from app.instruments.registry import VirtualPlayerRegistry
 from app.input.chart_parser import ChartParser
 from app.music.sectionizer import SECTION_COLORS

@@ -75,7 +75,11 @@ def generate_test_song(output_path: str = "test_song_120bpm.wav", sr: int = 4410
 
     total_measures = total_cycles  # Número de repetições da progressão (cada ciclo = 4 compassos = 8s)
     full_audio_chords = []
-    full_clicks = np.zeros(int(sr * chord_duration * len(progression) * total_measures), dtype=np.float32)
+    # Cada acorde tem int(sr * chord_duration) amostras (truncado por acorde, como em
+    # generate_chord); o buffer de cliques precisa da MESMA soma, senão BPMs que não
+    # dividem o sample rate exato (ex.: 92, 138) geram buffers de tamanhos diferentes.
+    samples_per_chord = int(sr * chord_duration)
+    full_clicks = np.zeros(samples_per_chord * len(progression) * total_measures, dtype=np.float32)
 
     sample_idx = 0
     for _ in range(total_measures):
