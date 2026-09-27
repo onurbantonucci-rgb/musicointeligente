@@ -3,9 +3,12 @@
 Gera a progressão clássica: C -> G -> Am -> F a 120 BPM com cliques de metrônomo.
 """
 
+import logging
 import os
 import numpy as np
 import soundfile as sf
+
+logger = logging.getLogger(__name__)
 
 
 def generate_tone(freq: float, duration: float, sr: int = 44100, harmonics: int = 4) -> np.ndarray:
@@ -112,7 +115,7 @@ def generate_test_song(output_path: str = "test_song_120bpm.wav", sr: int = 4410
 
     abs_path = os.path.abspath(output_path)
     sf.write(abs_path, stereo, sr, subtype="PCM_16")
-    print(f"[AudioGenerator] Arquivo de teste gerado com sucesso: {abs_path}")
+    logger.info("Arquivo de teste gerado com sucesso: %s", abs_path)
     return abs_path
 
 
@@ -178,8 +181,7 @@ def generate_acoustic_guitar_sample(output_path: str = "violao_teste_120bpm.wav"
       - Am (A2, E3, A3, C4, E4)
       - F (F2, C3, F3, A3, C4)
     """
-    beat_sec = 60.0 / bpm
-    bar_sec = beat_sec * 4.0  # 2.0s por acorde
+    beat_sec = 60.0 / bpm  # 4 batidas por compasso = 2.0s por acorde a 120 BPM
 
     # Voicings reais de violão acústico (frequências em Hz das cordas tocadas)
     guitar_voicings = [
@@ -218,7 +220,7 @@ def generate_acoustic_guitar_sample(output_path: str = "violao_teste_120bpm.wav"
 
     abs_path = os.path.abspath(output_path)
     sf.write(abs_path, stereo, sr, subtype="PCM_16")
-    print(f"[AudioGenerator] Áudio de violão acústico gerado: {abs_path}")
+    logger.info("Áudio de violão acústico gerado: %s", abs_path)
     return abs_path
 
 
@@ -270,7 +272,7 @@ def generate_modulating_song(
 
     abs_path = os.path.abspath(output_path)
     sf.write(abs_path, stereo, sr, subtype="PCM_16")
-    print(f"[AudioGenerator] Áudio modulante gerado: {abs_path}")
+    logger.info("Áudio modulante gerado: %s", abs_path)
     return abs_path
 
 

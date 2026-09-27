@@ -1,10 +1,14 @@
 """Detecção de Andamento (BPM), Rastreamento de Batidas (Beat Tracking) e Métricas Rítmicas."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Optional
 import numpy as np
 import librosa
+from scipy.signal import decimate as _scipy_decimate
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -97,10 +101,13 @@ class OnsetTempoDetector(TempoDetector):
             return 0.0
 
         try:
-            # Decimação para ~22050 Hz acelera o cálculo de onset STFT em mais de 3x mantendo precisão rítmica
+            # Decimação para ~22050 Hz acelera o cálculo de onset STFT em mais de 3x mantendo precisão rítmica.
+            # scipy.signal.decimate aplica um filtro anti-aliasing antes de subamostrar; um
+            # simples audio[::2] deixaria conteúdo acima de Nyquist se dobrar de volta no
+            # espectro (aliasing), contaminando o envelope de onset usado para achar as batidas.
             if sample_rate > 22050:
                 hop = 2
-                decimated_audio = audio_data[::hop]
+                decimated_audio = _scipy_decimate(audio_data, hop).astype(np.float32)
                 eff_sr = sample_rate // hop
             else:
                 decimated_audio = audio_data
@@ -114,10 +121,10 @@ class OnsetTempoDetector(TempoDetector):
             # regressão tempo-de-batida × índice dá o período real e elimina a deriva.
             self._bpm = self._refine_bpm(self._beat_times, float(np.mean(tempo)))
             self._last_beat_idx = -1
-            print(f"[TempoDetector] BPM detectado: {self._bpm:.1f} | Total de batidas: {len(self._beat_times)}")
+            logger.info("BPM detectado: %.1f | Total de batidas: %d", self._bpm, len(self._beat_times))
             return self._bpm
         except Exception as e:
-            print(f"[TempoDetector] Erro ao detectar tempo: {e}")
+            logger.warning("Erro ao detectar tempo via librosa, usando fallback: %s", e)
             return self._analyze_audio_fallback(audio_data, sample_rate)
 
     @staticmethod
@@ -148,7 +155,7 @@ class OnsetTempoDetector(TempoDetector):
             return 0.0
 
         decimation = max(1, int(np.ceil(sample_rate / 22050.0)))
-        signal = audio[::decimation]
+        signal = _scipy_decimate(audio, decimation) if decimation > 1 else audio
         effective_rate = sample_rate / decimation
         frame_size = 1024
         hop_size = 256
@@ -205,8 +212,7 @@ class OnsetTempoDetector(TempoDetector):
         duration = len(audio) / float(sample_rate)
         self._beat_times = np.arange(peak_times[0], duration, interval, dtype=np.float32)
         self._last_beat_idx = -1
-        print(f"[TempoDetector] BPM por fallback: {self._bpm:.1f} | "
-              f"Total de batidas: {len(self._beat_times)}")
+        logger.info("BPM por fallback: %.1f | Total de batidas: %d", self._bpm, len(self._beat_times))
         return self._bpm
 
     def get_tempo_at_time(self, timestamp: float, tolerance_sec: float = 0.075) -> TempoResult:

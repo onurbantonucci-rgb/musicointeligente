@@ -4,12 +4,15 @@ Captura áudio de microfone, entrada de linha ou interface USB
 e entrega blocos de áudio através da mesma interface AudioSource.
 """
 
+import logging
 import threading
 from typing import Optional, List
 import numpy as np
 import sounddevice as sd
 
 from app.audio.audio_source import AudioSource
+
+logger = logging.getLogger(__name__)
 
 
 class LiveAudioSource(AudioSource):
@@ -51,7 +54,7 @@ class LiveAudioSource(AudioSource):
                         "default_samplerate": dev.get("default_samplerate")
                     })
         except Exception as e:
-            print(f"[LiveAudioSource] Erro ao enumerar dispositivos: {e}")
+            logger.error("Erro ao enumerar dispositivos: %s", e)
         return devices
 
     def start(self) -> None:
@@ -70,10 +73,10 @@ class LiveAudioSource(AudioSource):
                 )
                 self._stream.start()
                 self._active = True
-                print(f"[LiveAudioSource] Captura ao vivo iniciada em {self._sample_rate}Hz")
+                logger.info("Captura ao vivo iniciada em %dHz", self._sample_rate)
             except Exception as e:
                 self._active = False
-                print(f"[LiveAudioSource] Erro ao iniciar captura: {e}")
+                logger.error("Erro ao iniciar captura: %s", e)
                 raise e
 
     def _input_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:

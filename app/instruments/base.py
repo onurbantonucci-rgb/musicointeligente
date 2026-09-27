@@ -1,8 +1,11 @@
 """Contratos e interfaces base para instrumentos virtuais autônomos."""
 
+import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional
 from app.music.musical_context import MusicalContext
+
+logger = logging.getLogger(__name__)
 
 
 class VirtualInstrument(ABC):
@@ -44,7 +47,7 @@ class VirtualBand:
             try:
                 member.on_musical_context(context)
             except Exception as e:
-                print(f"[VirtualBand] Erro no integrante {member.instrument_name}: {e}")
+                logger.error("Erro no integrante %s: %s", member.instrument_name, e)
 
     def reset_all(self) -> None:
         for member in self._members:

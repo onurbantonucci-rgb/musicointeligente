@@ -4,12 +4,15 @@ Gerencia a Banda Virtual conectando o BassPlayer funcional e expondo interfaces
 e contratos para os futuros integrantes (Bateria, Teclado e Guitarra).
 """
 
+import logging
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Any
 
-from app.instruments.base import VirtualInstrument, VirtualBand
+from app.instruments.base import VirtualInstrument
 from app.instruments.bass_player import BassPlayer
 from app.music.musical_context import MusicalContext
+
+logger = logging.getLogger(__name__)
 
 
 class AdaptiveMusicalClock(ABC):
@@ -84,7 +87,7 @@ class VirtualPlayerRegistry:
                 if ev is not None:
                     events[slot] = ev
             except Exception as e:
-                print(f"[VirtualPlayerRegistry] Erro ao despachar contexto para {slot}: {e}")
+                logger.error("Erro ao despachar contexto para %s: %s", slot, e)
         return events
 
     def reset_all(self) -> None:

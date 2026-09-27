@@ -14,6 +14,7 @@ Executa a cadeia completa e integrada de DSP, MIR e Memória Temporal:
      - Sincronização com o Relógio Musical (MusicalClock)
 """
 
+import logging
 import threading
 from typing import Optional, List, TYPE_CHECKING
 
@@ -27,9 +28,9 @@ from app.analysis.chroma_extractor import ChromaExtractor
 from app.analysis.active_notes import ActiveNoteTracker
 from app.analysis.harmonic_analyzer import HarmonicAnalyzer, DefaultHarmonicAnalyzer
 from app.analysis.chord_detector import Chord, ChordDetector
-from app.analysis.chord_history import ChordHistory, ChordEvent
+from app.analysis.chord_history import ChordHistory
 from app.analysis.key_detector import KeyDetector, KeyResult, KrumhanslSchmucklerKeyDetector
-from app.analysis.key_history import KeyHistory, KeyEvent
+from app.analysis.key_history import KeyHistory
 from app.analysis.tempo_detector import OnsetTempoDetector, TempoResult
 from app.music.musical_context import MusicalContext
 from app.music.chord_chart import parse_chord
@@ -41,6 +42,8 @@ from app.analysis.structure_report import export_structure_report
 from app.instruments.base import VirtualBand
 from app.instruments.bass_player import BassPlayer
 from app.utils.timing import LatencyTracker
+
+logger = logging.getLogger(__name__)
 
 
 class AudioAnalyzer:
@@ -265,7 +268,7 @@ class AudioAnalyzer:
         """Altera o detector de pitch em tempo de execução."""
         with self._lock:
             self._pitch_detector = create_pitch_detector(algorithm_name)
-            print(f"[AudioAnalyzer] Algoritmo de pitch alterado para: {self._pitch_detector.algorithm_name}")
+            logger.info("Algoritmo de pitch alterado para: %s", self._pitch_detector.algorithm_name)
 
     def pre_analyze_track(self, mono_audio: np.ndarray, sample_rate: int) -> float:
         """Pré-analisa a faixa de áudio para extração global de BPM e grade de batidas."""

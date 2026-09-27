@@ -1,5 +1,6 @@
 """Reprodutor de áudio em tempo real com controle de transporte e sincronização."""
 
+import logging
 from enum import Enum
 import threading
 import time
@@ -8,6 +9,8 @@ import numpy as np
 import sounddevice as sd
 
 from app.audio.audio_source import AudioSource
+
+logger = logging.getLogger(__name__)
 
 
 class PlaybackState(Enum):
@@ -85,7 +88,7 @@ class AudioPlayer:
             )
             self._stream.start()
         except Exception as e:
-            print(f"[AudioPlayer] Erro ao iniciar stream de saída de áudio: {e}")
+            logger.error("Erro ao iniciar stream de saída de áudio: %s", e)
             self._stream = None
 
     @property
