@@ -1,7 +1,7 @@
 """Widget Canvas de alta performance para renderização de Waveform e Seek interativo."""
 
 import tkinter as tk
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable
 import numpy as np
 
 

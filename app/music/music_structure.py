@@ -7,7 +7,6 @@ do Virtual Band AI, sem forçar classificações rígidas e admitindo UNKNOWN co
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Dict, Optional, Any
-import numpy as np
 
 
 class SectionType(Enum):

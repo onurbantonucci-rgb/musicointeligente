@@ -11,7 +11,7 @@ antes de ingressar no ChartParser e convergir para o ChordChart.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Any
 import os
 
 try:

@@ -22,7 +22,7 @@ from app.music.constants import (
     WEIGHT_KEY_STABILITY,
     MAX_KEY_HISTORY_ENTRIES,
 )
-from app.music.theory import compute_chord_key_compatibility, PITCH_CLASSES
+from app.music.theory import compute_chord_key_compatibility
 
 
 @dataclass

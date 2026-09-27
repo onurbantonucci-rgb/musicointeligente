@@ -2,7 +2,6 @@
 
 import tkinter as tk
 from typing import List
-import numpy as np
 
 from app.music.theory import PITCH_CLASSES
 

@@ -10,7 +10,7 @@ Capaz de:
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple, Any
 
-from app.music.music_structure import MusicPosition, MusicalPattern, SectionTransition
+from app.music.music_structure import MusicPosition, MusicalPattern
 from app.music.pattern_memory import PatternMemory
 
 

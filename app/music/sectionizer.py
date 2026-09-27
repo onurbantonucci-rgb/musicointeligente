@@ -13,7 +13,7 @@ Também expõe um mapa de cores por tipo de seção, para a interface diferencia
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 from app.music.chord_chart import parse_chord
 

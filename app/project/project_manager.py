@@ -4,16 +4,15 @@ Controla o salvamento e carregamento de projetos em JSON, importação de músic
 orquestração de setlists e transição atômica entre SongSessions sem vazamento de estado.
 """
 
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Any, Tuple
 import json
 import os
 import tempfile
 from datetime import datetime
 
-from app.project.project import Project, ProjectSettings
-from app.setlist.setlist import Setlist
+from app.project.project import Project
 from app.setlist.setlist_manager import SetlistManager
-from app.song.song import Song, PerformanceSettings
+from app.song.song import Song
 from app.song.song_session import SongSession
 from app.input.chart_parser import ChartParser
 

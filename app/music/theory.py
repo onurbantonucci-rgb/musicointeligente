@@ -3,7 +3,7 @@
 Tabelas de frequências padrão A440, mapeamentos de notas, intervalos e modelos de acordes.
 """
 
-from typing import Tuple, List, Dict
+from typing import Tuple, List
 import numpy as np
 
 # Nomes das 12 classes de pitch na escala temperada

@@ -14,15 +14,14 @@ from enum import Enum
 from app.song.song import Song
 from app.music.musical_context import MusicalContext
 from app.music.musical_clock import MusicalClock
-from app.music.chord_chart import ChordChart, ChartSection, ChartChord, parse_chord
+from app.music.chord_chart import ChordChart, parse_chord
 from app.input.chart_parser import ChartParser
 from app.input.chart_semantic_classifier import ChartSemanticClassifier
 from app.music.chart_alignment import ChartAlignment, ChartPosition, StartAnchor
 from app.music.chart_audio_fusion import ChartAudioFusion, FusedMusicalState
 from app.analysis.music_structure_analyzer import MusicStructureAnalyzer
-from app.music.pattern_memory import PatternMemory
 from app.music.prediction_engine import PredictionEngine, MusicPrediction
-from app.music.position_estimator import PositionEstimator, TrackingState, EstimatedPosition
+from app.music.position_estimator import PositionEstimator, TrackingState
 from app.analysis.tempo_detector import TempoResult
 from app.music.follow_confidence import calculate_follow_confidence
 from app.music.harmonic_rhythm import HarmonicRhythmTracker

@@ -4,7 +4,7 @@ Controla a seleção, troca de música, histórico isolado e navegação
 (primeira, última, próxima, anterior) entre as músicas de um Setlist.
 """
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict
 import json
 import os
 

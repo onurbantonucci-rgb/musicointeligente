@@ -7,7 +7,7 @@ Implementa arquitetura plugável com múltiplos algoritmos:
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Type, List
+from typing import Dict, Type
 import numpy as np
 
 from app.music.theory import hz_to_note_name

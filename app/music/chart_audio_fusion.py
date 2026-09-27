@@ -6,11 +6,11 @@ Implementa a hierarquia prioritária de conhecimento musical:
 3. EXECUTION VARIATIONS — Detecção de divergências sem sobrescrever a cifra.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 
 from app.music.chart_alignment import ChartPosition
-from app.music.chord_chart import parse_chord, ChordSymbol
+from app.music.chord_chart import parse_chord
 from app.input.chart_semantic_classifier import ChartSemanticClassifier
 
 

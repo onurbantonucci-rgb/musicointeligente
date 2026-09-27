@@ -4,10 +4,10 @@ Permite navegar, projetar e correlacionar a posição contínua do MusicalClock
 com os compassos, seções, acordes, letras e linhas físicas do ChordChart.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Any, Tuple
 
-from app.music.chord_chart import ChordChart, ChartSection, ChartChord, LyricSegment, ChartLineInfo
+from app.music.chord_chart import ChordChart, ChartSection, ChartChord
 from app.music.musical_clock import MusicalClock
 from app.input.chart_semantic_classifier import ChartSemanticClassifier
 

@@ -6,15 +6,14 @@ detectando seções, títulos e anotações, e mantendo métricas de confiança 
 modificações silenciosas de acordes.
 """
 
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Tuple, Any
 import os
-import re
 import subprocess
 import json
-from PIL import Image, ImageOps
+from PIL import Image
 
 from app.input.chart_sources import ExtractedToken, RawChartDocument
-from app.input.chart_parser import ChartParser, CHORD_REGEX
+from app.input.chart_parser import ChartParser
 
 
 class ImageChartExtractor:

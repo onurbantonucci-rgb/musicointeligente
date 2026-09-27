@@ -8,7 +8,7 @@ Responsável por:
 5. Considerar a tonalidade para identificação da escala diatônica.
 """
 
-from typing import Optional, List, Tuple
+from typing import Optional, Tuple
 from app.instruments.bass_model import BassDecision, BassPatternType
 from app.music.musical_context import MusicalContext
 from app.music.theory import PITCH_CLASSES, get_scale_notes

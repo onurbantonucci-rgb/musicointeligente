@@ -8,13 +8,13 @@ Atua como ponte orquestradora entre os detectores brutos de DSP/MIR e o estado m
   5. Atualiza o MusicalContext thread-safe pronto para consumo pela UI e futuros músicos virtuais.
 """
 
-from typing import Optional, List, Dict
+from typing import Optional, Dict
 import numpy as np
 
 from app.music.musical_context import MusicalContext
 from app.music.musical_clock import MusicalClock
-from app.analysis.chord_history import ChordHistory, ChordStabilizer, ChordEvent
-from app.analysis.key_history import KeyHistory, KeyStabilizer, KeyEvent
+from app.analysis.chord_history import ChordHistory, ChordStabilizer
+from app.analysis.key_history import KeyHistory, KeyStabilizer
 from app.analysis.pitch_detector import PitchResult
 from app.analysis.chord_detector import Chord
 from app.analysis.key_detector import KeyResult

@@ -10,27 +10,19 @@ Executa:
    - OFFLINE: Análise estrutural completa da faixa inteira para planejamento prévio.
 """
 
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any
 import numpy as np
 
 from app.music.music_structure import (
     MusicSection,
     MusicalPattern,
-    PatternOccurrence,
-    SectionTransition,
-    MusicPosition,
     MusicStructure,
-    SectionType,
 )
-from app.music.harmonic_normalization import (
-    NormalizedChordSequence,
-    normalize_chord_sequence,
-    sequence_similarity,
-)
+from app.music.harmonic_normalization import normalize_chord_sequence
 from app.music.pattern_memory import PatternMemory
 from app.music.prediction_engine import PredictionEngine, MusicPrediction
 from app.analysis.music_position_estimator import MusicPositionEstimator
-from app.analysis.chord_history import ChordHistory, ChordEvent
+from app.analysis.chord_history import ChordHistory
 from app.analysis.key_history import KeyHistory
 from app.music.musical_clock import MusicalClock
 from app.music.musical_context import MusicalContext
@@ -172,7 +164,6 @@ class MusicStructureAnalyzer:
     ) -> MusicStructure:
         """Executa atualização incremental leve em tempo real (chamada em cada ciclo da UI)."""
         current_bar = max(1, context.bar)
-        current_beat = max(1, context.beat)
         timestamp = context.timestamp
 
         # Acumula acorde vigente na frase se o compasso avançou

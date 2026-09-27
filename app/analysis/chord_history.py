@@ -7,7 +7,7 @@ Responsável por:
 4. Fornecer informações de acorde anterior (previous_chord) e duração do acorde atual (chord_duration).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Dict
 import collections
 import numpy as np

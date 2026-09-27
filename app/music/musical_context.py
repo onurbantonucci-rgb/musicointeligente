@@ -7,7 +7,7 @@ diretamente, sem precisar analisar o sinal de áudio bruto.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Dict
 
 
 @dataclass

@@ -13,7 +13,7 @@ Exemplos:
 """
 
 import re
-from typing import Optional, Tuple
+from typing import Tuple
 
 from app.music.theory import PITCH_CLASSES, ENHARMONIC_MAP, note_to_pc
 

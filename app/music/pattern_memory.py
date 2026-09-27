@@ -7,7 +7,6 @@ e contexto tonal.
 
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
-import numpy as np
 
 from app.music.music_structure import MusicalPattern, PatternOccurrence, SectionTransition
 from app.music.harmonic_normalization import (

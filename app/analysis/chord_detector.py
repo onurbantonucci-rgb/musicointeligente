@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
-import collections
 import numpy as np
 
 from app.music.theory import (
@@ -63,6 +62,8 @@ class Chord:
     duration: float = 0.0                       # Duração acumulada em segundos
 
 
+# Re-exportado (não usado neste módulo): harmonic_analyzer.py, app/analysis/__init__.py
+# e tests/test_chords.py importam ChordHistory/ChordEvent a partir DAQUI. Não remover.
 from app.analysis.chord_history import ChordHistory, ChordEvent
 
 

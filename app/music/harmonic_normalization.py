@@ -6,8 +6,7 @@ garantindo invariância à transposição tonal e tolerância a ruídos de detec
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
-import numpy as np
+from typing import List, Optional, Dict, Any
 
 from app.music.theory import PITCH_CLASSES, ENHARMONIC_MAP, get_chord_notes
 

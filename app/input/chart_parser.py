@@ -15,15 +15,10 @@ from app.music.chord_chart import (
     LyricSegment,
     ChartLineInfo,
     parse_chord,
-    ChordSymbol
 )
 from app.input.chart_semantic_classifier import (
     ChartSemanticClassifier,
     SemanticLineType,
-    ClassifiedLine,
-    CHORD_REGEX,
-    COMMON_WORDS,
-    SECTION_MAP
 )
 
 

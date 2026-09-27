@@ -12,7 +12,6 @@ pode informar o deslocamento aos músicos virtuais.
 """
 
 from collections import deque, Counter
-from typing import Optional
 
 from app.music.theory import note_to_pc
 

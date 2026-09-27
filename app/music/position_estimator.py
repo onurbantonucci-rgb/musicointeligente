@@ -15,12 +15,12 @@ recuperação contextual por janela local e correspondência de progressão.
 """
 
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional, List, Dict, Tuple, Any, Set
 
 from app.music.chart_alignment import ChartAlignment, ChartPosition
-from app.music.chord_chart import ChordChart, parse_chord
+from app.music.chord_chart import parse_chord
 from app.music.theory import note_to_pc, get_chord_notes, PITCH_CLASSES
 from app.music.musical_clock import MusicalClock
 from app.analysis.music_structure_analyzer import MusicStructureAnalyzer
@@ -722,11 +722,18 @@ class PositionEstimator:
             if not self._recent_expected or self._recent_expected[-1] != expected_chord:
                 self._recent_expected.append(expected_chord)
 
-        # Acorde previsto estruturalmente (Prediction fallback)
-        predicted_chord = nominal_pos.next_chord
+        # Acorde previsto estruturalmente (Prediction fallback). Guardamos a substituição
+        # do motor de previsão separada do valor derivado de nominal_pos: se uma recuperação
+        # mais adiante reancorar a posição, nominal_pos.next_chord é reconsultado no retorno
+        # em vez de usar um valor obsoleto calculado para a posição anterior.
+        # BUG corrigido: MusicPrediction expõe a lista ``predicted_chords`` (plural);
+        # o atributo singular ``predicted_next_chord`` nunca existiu, então este fallback
+        # sempre resultava em None e nunca disparava. Usamos o primeiro item da lista.
+        predicted_chord_override = None
         pred = getattr(self._prediction_engine, "latest_prediction", None)
-        if pred and getattr(pred, "predicted_next_chord", None) and pred.predicted_next_chord != "--":
-            predicted_chord = pred.predicted_next_chord
+        pred_chords = getattr(pred, "predicted_chords", None) if pred else None
+        if pred_chords and pred_chords[0] and pred_chords[0] != "--":
+            predicted_chord_override = pred_chords[0]
 
         # 2. Avaliação Harmônica do Áudio
         is_unknown_audio = not detected_chord or detected_chord in ("--", "UNKNOWN", "N") or detected_confidence < 0.25
@@ -761,8 +768,6 @@ class PositionEstimator:
                 self._tracking_state = TrackingState.TRACKING
                 self._position_confidence = max(0.85, 0.95 - (self._consecutive_unknown_seconds * 0.04))
                 action_note = "Aguardando evidência harmônica" if audio_observable else "Avanço temporal contínuo"
-
-            effective_chord = expected_chord if expected_chord != "--" else predicted_chord
 
         else:
             # Áudio com acorde detectado convincente
@@ -819,7 +824,6 @@ class PositionEstimator:
                 )
                 self._last_confirmed_bar = current_bar
                 self._consecutive_mismatch_seconds = 0.0
-                effective_chord = expected_chord
                 if is_transposed_match:
                     action_note = f"Confirmada com transposição de {self._transposition.semitones:+d} semitons (capotraste/tom)"
                 elif root_only_match:
@@ -832,7 +836,6 @@ class PositionEstimator:
                 # CASO C: DIVERGÊNCIA (ÁUDIO DETECTOU ACORDE DIFERENTE)
                 # ----------------------------------------------------
                 self._consecutive_mismatch_seconds += dt
-                effective_chord = expected_chord  # A cifra permanece soberana
 
                 # Se a divergência for muito recente (< 2s), pode ser variação de performance ou antecipação
                 if self._consecutive_mismatch_seconds < 2.0:
@@ -869,7 +872,6 @@ class PositionEstimator:
                             self._set_chart_cursor(self._alignment.get_position_at(current_bar).element_index)
                             nominal_pos = self._cursor_state(self._cursor_position(
                                 current_beat, timestamp, current_bar))
-                            effective_chord = matched_chord
                         else:
                             action_note = f"Candidato local descartado (Comp. {matched_bar} fora da tolerância)"
                     else:
@@ -887,7 +889,6 @@ class PositionEstimator:
                             self._set_chart_cursor(self._alignment.get_position_at(current_bar).element_index)
                             nominal_pos = self._cursor_state(self._cursor_position(
                                 current_beat, timestamp, current_bar))
-                            effective_chord = nominal_pos.current_chord
                             self._position_confidence = min(0.90, self._position_confidence + 0.15)
                             action_note = (
                                 f"Reancorado por progressão "
@@ -912,7 +913,8 @@ class PositionEstimator:
             self._bar_offset = clock_bar - current_bar
         return self._consolidate_position(
             nominal_pos, detected_chord if not is_unknown_audio else "--",
-            detected_confidence, action_note, nominal_pos.next_chord,
+            detected_confidence, action_note,
+            predicted_chord_override or nominal_pos.next_chord,
         )
 
     @staticmethod
