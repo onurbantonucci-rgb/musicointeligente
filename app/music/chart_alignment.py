@@ -224,6 +224,14 @@ class ChartAlignment:
         """Quantidade de eventos de acorde após expandir as repetições declaradas."""
         return len(self._timeline_chords)
 
+    def event_chords(self) -> List[str]:
+        """Símbolos dos acordes na ordem real da cifra (repetições expandidas)."""
+        return [entry[1].symbol.original_symbol for entry in self._timeline_chords]
+
+    def section_start_events(self) -> List[int]:
+        """Índices de evento onde começa cada ocorrência de seção."""
+        return [index for index, entry in enumerate(self._timeline_chords) if entry[5] == 0]
+
     def get_position_for_event(self, event_index: int, beat: float = 1.0,
                                absolute_time: float = 0.0) -> ChartPosition:
         """Consulta um evento pela sua ordem real na cifra, incluindo repetições."""

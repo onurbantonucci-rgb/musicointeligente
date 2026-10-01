@@ -23,6 +23,7 @@ from app.audio.audio_loader import FileAudioSource
 from app.audio.audio_player import AudioPlayer, PlaybackState
 from app.analysis.audio_analyzer import AudioAnalyzer
 from app.analysis.tempo_detector import OnsetTempoDetector
+from app.analysis.chart_harmony_aligner import compute_beat_chroma
 from app.ui.waveform_view import WaveformView
 from app.ui.chroma_view import ChromaView
 from app.ui.edit_history import ChartEditState, EditHistory
@@ -774,19 +775,28 @@ class MainWindow:
         try:
             detector = OnsetTempoDetector()
             detector.analyze_audio(mono_data, sr)
-            self._tempo_results.put((generation, detector))
+            beat_chroma = None
+            if detector.bpm > 0:
+                try:
+                    # Harmonia por batida: permite alinhar a cifra ao arquivo antes de tocar.
+                    beat_chroma = compute_beat_chroma(mono_data, sr, detector.beat_times, detector.bpm)
+                except Exception:
+                    logging.getLogger(__name__).exception("Falha na análise harmônica por batida")
+            self._tempo_results.put((generation, detector, beat_chroma))
         except Exception:
             logging.getLogger(__name__).exception("Falha na análise de andamento")
 
     def _apply_pending_tempo_results(self) -> None:
         while True:
             try:
-                generation, detector = self._tempo_results.get_nowait()
+                generation, detector, beat_chroma = self._tempo_results.get_nowait()
             except queue.Empty:
                 break
             if generation != self._audio_generation or self._current_source is None:
                 continue
             bpm = self.analyzer.apply_tempo_analysis(detector)
+            self.analyzer.set_beat_chroma(beat_chroma)
+            self.analyzer.prepare_harmony_timeline(self.project_manager.active_session)
             self.lbl_val_bpm.config(text=f"{bpm:.0f} BPM", fg="#ffffff")
             self.lbl_sub_meter.config(text=f"Compasso: 1  |  {self.analyzer.clock.meter}")
             self.lbl_status_msg.config(text=f"Andamento detectado: {bpm:.0f} BPM. Pronto para tocar.")
@@ -802,6 +812,7 @@ class MainWindow:
                 session.resume()
             else:
                 session.start()
+            self.analyzer.prepare_harmony_timeline(session)
             if starting_from_zero:
                 sr = self._current_source.get_sample_rate()
                 opening = self._current_source.get_chunk_at(0, min(4096, sr))
@@ -825,7 +836,8 @@ class MainWindow:
 
     def _on_stop(self) -> None:
         self.player.stop()
-        self.analyzer.reset_musical_history()
+        # Mesma faixa: a grade de batidas e a cifra alinhada continuam valendo.
+        self.analyzer.reset_musical_history(keep_track_analysis=True)
         if self.project_manager.active_session is not None:
             self.project_manager.active_session.stop()
         self.virtual_players.reset_all()

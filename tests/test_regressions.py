@@ -169,7 +169,7 @@ class TestInterfaceRegressions(unittest.TestCase):
     def test_stale_tempo_results_are_ignored(self):
         window = self.window()
         old_result = Mock()
-        window._tempo_results.put((0, old_result))
+        window._tempo_results.put((0, old_result, None))
         window._apply_pending_tempo_results()
         window.analyzer.apply_tempo_analysis.assert_not_called()
 
@@ -177,9 +177,10 @@ class TestInterfaceRegressions(unittest.TestCase):
         window = self.window()
         result = Mock()
         window.analyzer.apply_tempo_analysis.return_value = 90.0
-        window._tempo_results.put((1, result))
+        window._tempo_results.put((1, result, None))
         window._apply_pending_tempo_results()
         window.analyzer.apply_tempo_analysis.assert_called_once_with(result)
+        window.analyzer.set_beat_chroma.assert_called_once_with(None)
 
     def test_failed_save_keeps_editor_marked_unsaved(self):
         window = self.window()

@@ -23,6 +23,7 @@ from app.instruments.bass_performance import BassPerformanceEngine
 from app.instruments.bass_synthesizer import BassSynthesizer
 from app.music.musical_context import MusicalContext
 from app.music.chord_chart import parse_chord
+from app.analysis.chart_harmony_aligner import HarmonyTimeline, MIN_CONFIDENCE
 from app.input.chart_semantic_classifier import ChartSemanticClassifier
 from app.music.constants import BASS_DEFAULT_VOLUME
 
@@ -58,7 +59,10 @@ class BassPlayer(VirtualInstrument):
         self._last_scheduled_time: Optional[float] = None
         self._generation_id: Optional[int] = None
         self._last_chart_position_chord: str = "--"
-        self._chart_rhythm_anchor_grid: float = 0.0
+        # Cifra alinhada ao arquivo de áudio (pré-análise). Quando presente, o modo
+        # cifra agenda cada nota na batida real do áudio com o acorde da cifra.
+        self._harmony_timeline: Optional[HarmonyTimeline] = None
+        self._timeline_chords: Dict[tuple, str] = {}
 
         # Histórico recente para modo debug e UI (ring-buffer)
         self._recent_events: collections.deque = collections.deque(maxlen=30)
@@ -127,8 +131,30 @@ class BassPlayer(VirtualInstrument):
         self._generation_id = context.position_generation
         self._last_triggered_beat = None
         self._last_chart_position_chord = self._published_chart_chord(context)
-        self._chart_rhythm_anchor_grid = 0.0
+        timeline = self._active_timeline(chart_only=True)
+        if timeline is not None:
+            return self._schedule_from_timeline(context, timeline)
         return self._schedule_root_grid(context, allow_current=True)
+
+    @property
+    def harmony_timeline(self) -> Optional[HarmonyTimeline]:
+        return self._harmony_timeline
+
+    def set_harmony_timeline(self, timeline: Optional[HarmonyTimeline]) -> None:
+        """Instala (ou remove) a cifra alinhada ao áudio do arquivo atual."""
+        if timeline is self._harmony_timeline:
+            return
+        self._harmony_timeline = timeline
+        self._timeline_chords.clear()
+        self._synthesizer.cancel_scheduled()
+        self._last_triggered_beat = None
+
+    def _active_timeline(self, chart_only: bool) -> Optional[HarmonyTimeline]:
+        timeline = self._harmony_timeline
+        if (not chart_only or timeline is None or timeline.beat_count == 0 or
+                timeline.confidence < MIN_CONFIDENCE):
+            return None
+        return timeline
 
     @property
     def harmony_source(self) -> BassHarmonySource:
@@ -141,7 +167,6 @@ class BassPlayer(VirtualInstrument):
         self._synthesizer.stop_voices()
         self._last_triggered_beat = None
         self._last_chart_position_chord = "--"
-        self._chart_rhythm_anchor_grid = 0.0
 
     @property
     def volume(self) -> float:
@@ -234,7 +259,6 @@ class BassPlayer(VirtualInstrument):
         self._last_scheduled_time = None
         self._generation_id = None
         self._last_chart_position_chord = "--"
-        self._chart_rhythm_anchor_grid = 0.0
         self._last_context = None
         self._recent_events.clear()
 
@@ -279,17 +303,25 @@ class BassPlayer(VirtualInstrument):
             return None
 
         chart_only = self._harmony_source == BassHarmonySource.CHART
+        timeline = self._active_timeline(chart_only) if context.chart_available else None
         # A geração identifica uma mudança de transporte (seek, restart,
         # transposição ou nova sessão). Faça esta sincronização antes de
         # comparar a harmonia atual: assim uma posição nova nunca herda uma
         # nota, uma grade ou um acorde da posição anterior.
-        self._sync_position_generation(context, chart_only)
+        self._sync_position_generation(context, chart_only, keep_voices=timeline is not None)
+        if timeline is not None:
+            # Cifra já alinhada ao arquivo: harmonia da cifra, batidas do áudio.
+            # A posição publicada pela sessão (que só confirma trocas depois de
+            # ouvi-las) não participa do agendamento.
+            self._last_context = context
+            return self._schedule_from_timeline(context, timeline)
         if chart_only:
-            # A mesma ChartPosition que a UI destaca manda na harmonia. Áudio
-            # só continua fornecendo tempo, fase e atividade da performance.
+            # Sem a pré-análise (entrada ao vivo, cifra que não bate com o áudio),
+            # a harmonia vem do cursor publicado da cifra e o tempo, do relógio.
             if not context.chart_available:
                 return None
-            active_chord = self._published_chart_chord(context)
+            active_chord = self._chart_chord_for_target(
+                context, max(1, context.clock_bar), max(1, context.clock_bar))
         else:
             active_chord = context.chord
         self._last_context = context
@@ -311,9 +343,9 @@ class BassPlayer(VirtualInstrument):
                 not ChartSemanticClassifier.is_chord_shaped(active_chord)):
             self._synthesizer.cancel_scheduled()
             return None
-        if chart_only and self._chart_root_changed(active_chord):
-            return self._schedule_chart_harmony_change(context, active_chord)
         if chart_only:
+            # Uma troca confirmada no meio de um pulso vale a partir do PRÓXIMO
+            # pulso da grade: nunca criamos ataques fora da subdivisão escolhida.
             self._last_chart_position_chord = active_chord
         if context.tempo_tracking_state != "UNINITIALIZED":
             return self._schedule_next_beat(context)
@@ -430,9 +462,9 @@ class BassPlayer(VirtualInstrument):
             beat = 1
         key = (bar, beat)
         if chart_only:
-            # Não antecipa outro acorde com um cursor paralelo: enquanto a UI
-            # mostra o acorde atual, o baixo agenda esse mesmo acorde.
-            next_chord = self._published_chart_chord(context)
+            # Harmonia da cifra para o compasso do pulso, na grade do áudio (ver
+            # _chart_chord_for_target): sem esperar o cursor confirmar a troca.
+            next_chord = self._chart_chord_for_target(context, clock_bar, bar)
             source = "chart-only"
             if (next_chord == "--" or
                     not ChartSemanticClassifier.is_chord_shaped(next_chord)):
@@ -545,20 +577,116 @@ class BassPlayer(VirtualInstrument):
         self._current_event = event
         return event
 
+    # Janela de agendamento à frente da leitura: cobre alguns callbacks de áudio.
+    _TIMELINE_HORIZON = 0.45
+
+    def _schedule_from_timeline(self, context: MusicalContext,
+                                timeline: HarmonyTimeline) -> Optional[BassNoteEvent]:
+        """Agenda os próximos pulsos nas batidas REAIS do áudio com o acorde da cifra.
+
+        A grade rítmica é a escolhida pelo usuário (subdivisão), contada a partir
+        dos tempos 1 localizados no áudio; nenhum ataque extra é criado quando o
+        acorde muda. Chamado a cada tick: pulsos já agendados e iguais são
+        mantidos, pulsos já tocados nunca voltam.
+        """
+        now = max(0.0, context.timestamp)
+        # Um pulso em ``now`` ainda pode entrar se o áudio não foi renderizado além
+        # dele (ex.: a primeira batida em t=0); o que já saiu nunca é reagendado.
+        earliest = now - 0.001
+        rendered = self._synthesizer.rendered_until_time
+        if rendered is not None and now - 0.001 < rendered <= now + 0.5:
+            earliest = rendered + 0.001
+        fundamentals = self._pattern_override == BassPatternType.FUNDAMENTALS
+        interval = self._note_value.beats if fundamentals else 1.0
+        generation = context.position_generation
+        first_event: Optional[BassNoteEvent] = None
+        for pulse in timeline.pulses(earliest, now + self._TIMELINE_HORIZON, interval):
+            key = ("timeline", pulse.beat_index, pulse.subdivision)
+            if self._synthesizer.was_rendered(key):
+                continue
+            chord = timeline.chord_at_beat(pulse.beat_index)
+            pending = self._synthesizer.scheduled_note(key)
+            if chord is None or not ChartSemanticClassifier.is_chord_shaped(chord):
+                if pending is not None:
+                    self._synthesizer.cancel_scheduled(key)
+                continue
+            if (pending is not None and self._timeline_chords.get(key) == chord and
+                    abs(pending.scheduled_time - pulse.time) < 1e-4):
+                continue
+            decision_context = self._decision_context_for(context, chord)
+            if fundamentals:
+                decision = self._decision_engine.decide(
+                    decision_context, pattern_override=BassPatternType.FUNDAMENTALS)
+                note_name, midi_note, reason = decision.root_note, decision.root_midi, "Fundamental da cifra"
+                duration = interval * pulse.period * .85
+            else:
+                decision = self._decision_engine.decide(
+                    decision_context, pattern_override=self._pattern_override)
+                beats = timeline.beats_per_bar
+                steps = self._pattern_generator.generate_pattern(
+                    decision, beats=beats, chord_duration_beats=float(beats))
+                step = next((item for item in steps if item[0] == pulse.beat_in_bar), None)
+                if step is None:
+                    if pending is not None:
+                        self._synthesizer.cancel_scheduled(key)
+                    continue
+                _, note_name, midi_note, reason = step
+                sustained = decision.pattern_type == BassPatternType.SUSTAINED
+                duration = pulse.period * (beats * .95 if sustained else .85)
+            self._current_decision = decision
+            on_beat = pulse.subdivision == 0
+            velocity = (100 if on_beat and pulse.beat_in_bar == 1 else
+                        92 if on_beat and pulse.beat_in_bar == 3 else 85 if on_beat else 78)
+            self._synthesizer.schedule_note(
+                key, pulse.time, midi_note, velocity, duration,
+                source="chart-timeline", confidence=timeline.confidence,
+                generation_id=generation, note=note_name, musical_time=pulse.time)
+            self._timeline_chords[key] = chord
+            event = BassNoteEvent(
+                note=note_name, midi_note=midi_note, start_time=round(pulse.time, 4),
+                duration=round(duration, 4), velocity=velocity,
+                beat=pulse.beat_in_bar, bar=pulse.bar,
+                confidence=decision.confidence, reason=reason)
+            if self._recent_events and self._recent_events[-1].start_time == event.start_time:
+                self._recent_events.pop()
+            self._recent_events.append(event)
+            self._current_event = event
+            if first_event is None:
+                first_event = event
+        if len(self._timeline_chords) > 64:
+            keep_from = timeline.beat_index_at(now) - 2
+            self._timeline_chords = {key: chord for key, chord in self._timeline_chords.items()
+                                     if key[1] >= keep_from}
+        return first_event
+
+    @staticmethod
+    def _decision_context_for(context: MusicalContext, chord: str) -> MusicalContext:
+        decision_context = copy.copy(context)
+        symbol = parse_chord(chord)
+        decision_context.chord = chord
+        decision_context.chord_root = symbol.root
+        decision_context.chord_quality = symbol.quality
+        decision_context.bass_note = symbol.bass_note or symbol.root
+        decision_context.inversion = ("slash" if symbol.bass_note and symbol.bass_note != symbol.root
+                                      else "root")
+        decision_context.chord_confidence = 1.0
+        return decision_context
+
     @staticmethod
     def _chart_chord_for_target(context: MusicalContext, clock_bar: int,
                                 target_bar: int) -> str:
-        """Compatibilidade para previsões; prioridade ao acorde publicado na UI."""
-        current = getattr(context, "chart_published_chord", "--")
-        if not ChartSemanticClassifier.is_chord_shaped(current):
-            current = context.chart_clock_chord
-        if not ChartSemanticClassifier.is_chord_shaped(current):
-            current = context.chord
-        if target_bar > clock_bar:
-            following = context.chart_next_clock_chord
-            if ChartSemanticClassifier.is_chord_shaped(following):
-                return following
-        return current
+        """Acorde da cifra para um pulso quando NÃO há cifra alinhada ao áudio.
+
+        Sem a pré-análise não sabemos quantos compassos cada acorde dura (a cifra
+        do Cifra Club não informa), então projetar a cifra no relógio erra com
+        frequência. Usamos o cursor publicado, que só avança quando o áudio
+        confirma a troca: correto, ainda que com a latência da confirmação.
+        """
+        for chord in (getattr(context, "chart_published_chord", "--"), context.chord,
+                      context.chart_clock_chord):
+            if ChartSemanticClassifier.is_chord_shaped(chord):
+                return chord
+        return "--"
 
     @staticmethod
     def _published_chart_chord(context: MusicalContext) -> str:
@@ -572,8 +700,13 @@ class BassPlayer(VirtualInstrument):
         return context.chart_clock_chord
 
     def _sync_position_generation(self, context: MusicalContext,
-                                  chart_only: bool) -> None:
-        """Invalida decisões de uma posição musical anterior uma única vez."""
+                                  chart_only: bool, keep_voices: bool = False) -> None:
+        """Invalida decisões de uma posição musical anterior uma única vez.
+
+        Com a cifra alinhada ao áudio (``keep_voices``), uma relocalização da
+        sessão não muda nada do que o baixo toca: só a fila é refeita, sem
+        cortar a nota que está soando.
+        """
         if context.position_generation == self._generation_id:
             return
 
@@ -583,75 +716,15 @@ class BassPlayer(VirtualInstrument):
         self._last_triggered_beat = None
         self._last_chord = "--"
         self._last_scheduled_time = None
+        self._timeline_chords.clear()
 
-        if chart_only and was_initialized:
+        if chart_only and was_initialized and not keep_voices:
             # Nunca deixe uma voz ou previsão da posição anterior atravessar
             # um seek/restart. A chamada vem antes da comparação de acordes,
             # permitindo que o novo acorde da cifra seja atacado já neste tick.
             self._synthesizer.cancel_scheduled()
             self._synthesizer.stop_voices()
             self._last_chart_position_chord = "--"
-            self._chart_rhythm_anchor_grid = 0.0
-
-    def _chart_root_changed(self, chord: str) -> bool:
-        """Detecta uma troca real de tônica publicada pela cifra."""
-        previous = self._last_chart_position_chord
-        if not ChartSemanticClassifier.is_chord_shaped(previous):
-            return False
-        return parse_chord(previous).root != parse_chord(chord).root
-
-    def _schedule_chart_harmony_change(self, context: MusicalContext,
-                                       chord: str) -> Optional[BassNoteEvent]:
-        """Troca a harmonia no primeiro ponto seguro, acima da grade rítmica."""
-        bpm = context.bpm if context.bpm > 0 else 120.0
-        beat_duration = 60.0 / bpm
-        beats = max(1, int(context.meter.split("/")[0]))
-        phase = max(0.0, min(.999999, context.beat_position))
-        clock_bar = max(1, context.clock_bar)
-        clock_beat = max(1, context.clock_beat)
-        current_grid = ((clock_bar - 1) * beats + clock_beat - 1 + phase)
-        # Todo ataque futuro do acorde antigo perde a validade imediatamente.
-        self._synthesizer.cancel_scheduled()
-        rendered_until = self._synthesizer.rendered_until_time
-        output_horizon = max(0.0, context.output_latency) / 1000.0
-        start_time = context.timestamp + max(.010, output_horizon + .004)
-        if rendered_until is not None:
-            start_time = max(start_time, rendered_until + .004)
-        symbol = parse_chord(chord)
-        decision_context = copy.copy(context)
-        decision_context.chord = chord
-        decision_context.chord_root = symbol.root
-        decision_context.chord_quality = symbol.quality
-        decision_context.bass_note = symbol.bass_note or symbol.root
-        decision_context.inversion = "slash" if symbol.bass_note and symbol.bass_note != symbol.root else "root"
-        decision_context.chord_confidence = 1.0
-        started = time.perf_counter()
-        decision = self._decision_engine.decide(
-            decision_context, pattern_override=self._pattern_override)
-        context.decision_latency = (time.perf_counter() - started) * 1000.0
-        self._current_decision = decision
-        duration = self._note_value.beats * beat_duration * .85
-        # A entrada de uma nova harmonia começa pela tônica; os próximos ataques
-        # continuam sendo decididos pelo estilo selecionado na grade normal.
-        event = BassNoteEvent(
-            note=decision.root_note, midi_note=decision.root_midi,
-            start_time=round(start_time, 4), duration=round(duration, 4),
-            velocity=100, beat=clock_beat, bar=clock_bar,
-            confidence=decision.confidence, reason="Troca imediata da cifra")
-        key = ("chart-change", context.position_generation, round(start_time, 6))
-        self._synthesizer.schedule_note(
-            key, start_time, decision.root_midi, 100, duration,
-            source="chart-only", confidence=1.0,
-            generation_id=self._generation_id if self._generation_id is not None else context.position_generation,
-            note=decision.root_note, musical_time=start_time)
-        self._chart_rhythm_anchor_grid = current_grid
-        self._last_chart_position_chord = chord
-        self._last_triggered_beat = None
-        self._last_chord = chord
-        self._last_scheduled_time = start_time
-        self._recent_events.append(event)
-        self._current_event = event
-        return event
 
     def _schedule_root_grid(self, context: MusicalContext,
                             allow_current: bool = False,
@@ -673,9 +746,8 @@ class BassPlayer(VirtualInstrument):
         # O próximo ponto é preparado antes do callback de áudio alcançá-lo.
         lead_beats = (-1e-9 if allow_current and current_grid <= 1e-9
                       else .015 / beat_duration)
-        anchor = self._chart_rhythm_anchor_grid if chart_only else 0.0
-        grid_index = math.ceil((current_grid + lead_beats - anchor - 1e-9) / interval)
-        target_grid = max(0.0, anchor + grid_index * interval)
+        grid_index = math.ceil((current_grid + lead_beats - 1e-9) / interval)
+        target_grid = max(0.0, grid_index * interval)
         if not chart_only and context.performance_state == "RECOVERING":
             target_grid = math.ceil((current_grid + lead_beats) / beats_per_bar) * beats_per_bar
         start_time = context.timestamp + (target_grid - current_grid) * beat_duration
@@ -698,10 +770,9 @@ class BassPlayer(VirtualInstrument):
                 return None
 
         if chart_only:
-            # A identidade harmônica estrita é sempre a ChartPosition atual.
-            # Se ela mudar antes deste evento, _schedule_chart_harmony_change
-            # cancela a fila e substitui o ataque com a nova tônica.
-            target_chord = self._published_chart_chord(context)
+            # Harmonia da cifra para o compasso ONDE o pulso vai soar, na grade
+            # do áudio: o tempo 1 de um novo acorde já sai com a tônica nova.
+            target_chord = self._chart_chord_for_target(context, clock_bar, target_bar)
             if (target_chord == "--" or
                     not ChartSemanticClassifier.is_chord_shaped(target_chord)):
                 self._synthesizer.cancel_scheduled()

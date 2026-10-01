@@ -134,6 +134,8 @@ class SongSession:
         self._last_activity_time: Optional[float] = None
         self._recovery_started_at: Optional[float] = None
         self._recovery_evidence = 0
+        # O tempo 1 do relógio já foi alinhado ao primeiro ataque da música?
+        self._downbeat_anchored = False
         self._current_chart_pos: ChartPosition = self._position_estimator.refresh_position()
         self._last_confident_chart_pos = self._current_chart_pos
         self._current_fused_state: FusedMusicalState = FusedMusicalState(
@@ -311,6 +313,7 @@ class SongSession:
         self._last_activity_time = None
         self._recovery_started_at = None
         self._recovery_evidence = 0
+        self._downbeat_anchored = False
         self._follow_stability = 0.70
         self._last_follow_timestamp = None
         self._follow_observations_available = False
@@ -466,8 +469,10 @@ class SongSession:
             transition_beat=observed_onset)
         activity = self._has_musical_activity(source_context, detected_chord,
                                                detected_confidence, tempo_result)
+        previous_state = self._performance_state
         should_localize = self._update_performance_state(
             timestamp, activity, activity_observable=source_context is not None)
+        self._anchor_downbeat_on_music_start(previous_state, timestamp, source_context, tempo_result)
         if should_localize:
             old_offset = self._position_estimator.bar_offset
             self._current_chart_pos = self._position_estimator.update(
@@ -490,6 +495,42 @@ class SongSession:
             self._current_chart_pos = replace(self._last_confident_chart_pos,
                                                absolute_time=timestamp)
         return self._publish_position(detected_chord, detected_confidence, detected_key, source_context)
+
+    def _anchor_downbeat_on_music_start(self, previous_state: PerformanceState, timestamp: float,
+                                        source_context: Optional[MusicalContext],
+                                        tempo_result: Optional[TempoResult]) -> None:
+        """Alinha o TEMPO 1 do relógio ao primeiro ataque da música, uma única vez.
+
+        O relógio numera batidas a partir de t=0 do arquivo. Se a música começa
+        depois (silêncio, respiração, contagem), sem este alinhamento as barras de
+        compasso ficam deslocadas e a cifra projetada troca de acorde fora do lugar.
+        Só vale para o início real da música: atividade observada no áudio, logo
+        após o estado de espera, com a cifra ainda no evento inicial.
+        """
+        if (self._downbeat_anchored or source_context is None or
+                previous_state != PerformanceState.WAITING or
+                self._performance_state not in (PerformanceState.RECOVERING, PerformanceState.PLAYING)):
+            return
+        anchor = self._alignment.start_anchor
+        if anchor is not None and self._current_chart_pos.event_index != anchor.event_index:
+            return
+        observed_beat = None
+        if tempo_result is not None:
+            # A atividade é vista com ~90 ms de antecedência (janela à frente da
+            # análise): o ataque real é a PRÓXIMA batida pré-analisada, se estiver perto.
+            upcoming = tempo_result.next_beat_timestamp
+            if upcoming is not None and -0.04 <= upcoming - timestamp <= 0.25:
+                observed_beat = upcoming
+            elif tempo_result.beat_timestamp is not None:
+                observed_beat = tempo_result.beat_timestamp
+        if observed_beat is not None:
+            # Batida real da pré-análise: fixa fase e tempo 1 exatamente nela.
+            self._clock.align_downbeat_at(observed_beat, snap_phase=True)
+        else:
+            self._clock.align_downbeat_at(timestamp)
+        self._downbeat_anchored = True
+        # Previsões feitas na numeração antiga de compassos não valem mais.
+        self._position_generation += 1
 
     def _has_musical_activity(self, source_context: Optional[MusicalContext],
                                chord: str, chord_confidence: float,
@@ -612,9 +653,11 @@ class SongSession:
         # variação confirmada pela análise de áudio.
         ctx.chart_published_chord = position.current_chord if ctx.chart_available else "--"
         if self._alignment.event_count:
-            chart_bar = max(1, self.clock_bar - self._position_estimator.bar_offset)
-            ctx.chart_clock_chord = self._alignment.get_position_at(chart_bar).current_chord
-            ctx.chart_next_clock_chord = self._alignment.get_position_at(chart_bar + 1).current_chord
+            # Sem prender antes de somar: no pré-início (relógio no compasso 0, antes do
+            # tempo 1 da música) o próximo compasso é o 1 da cifra, não o 2.
+            chart_bar = self.clock_bar - self._position_estimator.bar_offset
+            ctx.chart_clock_chord = self._alignment.get_position_at(max(1, chart_bar)).current_chord
+            ctx.chart_next_clock_chord = self._alignment.get_position_at(max(1, chart_bar + 1)).current_chord
         else:
             ctx.chart_clock_chord = "--"
             ctx.chart_next_clock_chord = "--"

@@ -187,6 +187,11 @@ class BassSynthesizer:
         with self._lock:
             return sorted(self._scheduled.values(), key=lambda event: event.scheduled_time)
 
+    def scheduled_note(self, beat_key: tuple) -> Optional[ScheduledBassNote]:
+        """Nota ainda pendente para o pulso indicado, se houver."""
+        with self._lock:
+            return self._scheduled.get(beat_key)
+
     def was_rendered(self, beat_key: tuple) -> bool:
         """Distingue uma previsão cancelada de uma batida que já soou."""
         with self._lock:

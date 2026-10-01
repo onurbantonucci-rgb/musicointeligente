@@ -1,6 +1,7 @@
 """Detecção de Andamento (BPM), Rastreamento de Batidas (Beat Tracking) e Métricas Rítmicas."""
 
 import logging
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
@@ -30,6 +31,9 @@ class TempoResult:
     time_signature: str = "4/4"     # Fórmula de compasso estimada
     confidence: float = 0.0         # Confiança da periodicidade rítmica
     beat_timestamp: Optional[float] = None  # Pulso realmente observado, não a grade prevista
+    # Próxima batida da pré-análise a partir deste instante (o analisador olha ~90 ms
+    # à frente, então um ataque recém-detectado costuma estar LOGO DEPOIS do instante).
+    next_beat_timestamp: Optional[float] = None
 
 
 class TempoDetector(ABC):
@@ -78,6 +82,12 @@ class OnsetTempoDetector(TempoDetector):
     def beat_times(self) -> np.ndarray:
         return self._beat_times
 
+    def reset_live_state(self) -> None:
+        """Zera só o rastreamento ao vivo; a grade pré-analisada da faixa continua."""
+        self._last_beat_idx = -1
+        self._previous_energy = 0.0
+        self._live_pulse = None
+
     def reset(self) -> None:
         self._bpm = 0.0
         self._beat_times = np.array([], dtype=np.float32)
@@ -116,6 +126,9 @@ class OnsetTempoDetector(TempoDetector):
             # Extrair envelope de onset e calcular BPM e frames de batidas
             tempo, beat_frames = librosa.beat.beat_track(y=decimated_audio, sr=eff_sr)
             self._beat_times = librosa.frames_to_time(beat_frames, sr=eff_sr).astype(np.float32)
+            # A fase do beat_track tem viés sistemático (~+30 ms com quadros de 23 ms):
+            # alinhamos a grade ao ataque real, medido num envelope de alta resolução.
+            self._beat_times = self._refine_beat_phase(decimated_audio, eff_sr, self._beat_times)
             # O tempo do librosa é quantizado na grade do tempograma (ex.: 117.45 em vez
             # de 120). As posições das batidas são bem mais precisas: a inclinação da
             # regressão tempo-de-batida × índice dá o período real e elimina a deriva.
@@ -126,6 +139,41 @@ class OnsetTempoDetector(TempoDetector):
         except Exception as e:
             logger.warning("Erro ao detectar tempo via librosa, usando fallback: %s", e)
             return self._analyze_audio_fallback(audio_data, sample_rate)
+
+    @staticmethod
+    def _refine_beat_phase(audio: np.ndarray, sample_rate: int,
+                           beat_times: np.ndarray) -> np.ndarray:
+        """Desloca a grade de batidas para o ataque real do áudio (correção de fase global).
+
+        O ``librosa.beat.beat_track`` marca as batidas com resolução de um quadro
+        (~23 ms) e com atraso sistemático em relação ao início do ataque. Medimos,
+        num envelope de onset com hop curto (~3 ms), o pico de ataque mais próximo
+        de cada batida e aplicamos a MEDIANA desses desvios à grade inteira.
+        A grade continua uniforme (o BPM refinado não muda); só a fase é ajustada.
+        """
+        if len(beat_times) < 4 or sample_rate <= 0 or len(audio) < sample_rate:
+            return beat_times
+        hop = max(32, int(round(sample_rate * 0.003)))
+        envelope = librosa.onset.onset_strength(y=np.asarray(audio, dtype=np.float32),
+                                                sr=sample_rate, hop_length=hop)
+        times = librosa.times_like(envelope, sr=sample_rate, hop_length=hop)
+        window = 0.07
+        offsets = []
+        for beat in beat_times:
+            lo, hi = np.searchsorted(times, (beat - window, beat + window))
+            if hi - lo < 3:
+                continue
+            segment = envelope[lo:hi]
+            if float(np.max(segment)) <= 0.0:
+                continue
+            offsets.append(float(times[lo + int(np.argmax(segment))] - beat))
+        # Exige evidência consistente: poucas batidas ou desvios espalhados = sem ajuste.
+        if len(offsets) < 4 or float(np.std(offsets)) > 0.035:
+            return beat_times
+        shift = float(np.median(offsets))
+        if abs(shift) < 0.002 or abs(shift) > 0.06:
+            return beat_times
+        return np.clip(beat_times + shift, 0.0, None).astype(np.float32)
 
     @staticmethod
     def _refine_bpm(beat_times: np.ndarray, coarse_bpm: float) -> float:
@@ -236,6 +284,19 @@ class OnsetTempoDetector(TempoDetector):
             # Calcular fase fracionária no compasso (0.0 a 1.0)
             measure_duration = (60.0 / self._bpm) * self._beats_per_measure
             beat_pos = (timestamp % measure_duration) / measure_duration
+            earliest = timestamp - 0.04
+            first_beat = float(self._beat_times[0])
+            if earliest < first_beat:
+                # O beat_track costuma pular o primeiro ataque da música. A grade é
+                # uniforme (BPM refinado), então a estendemos para trás a partir da
+                # primeira batida detectada, mantendo a mesma fase.
+                period = 60.0 / self._bpm
+                steps_back = math.floor((first_beat - earliest) / period)
+                next_beat = first_beat - steps_back * period
+            else:
+                next_idx = int(np.searchsorted(self._beat_times, earliest))
+                next_beat = (float(self._beat_times[next_idx])
+                             if next_idx < len(self._beat_times) else None)
 
             return TempoResult(
                 bpm=round(self._bpm, 1),
@@ -245,6 +306,7 @@ class OnsetTempoDetector(TempoDetector):
                 time_signature="4/4",
                 confidence=0.88,
                 beat_timestamp=float(self._beat_times[closest_idx]) if is_beat else None,
+                next_beat_timestamp=next_beat,
             )
 
         # Caso contrário (estimativa analítica por tempo)

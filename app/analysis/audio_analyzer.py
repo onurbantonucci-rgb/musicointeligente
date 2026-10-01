@@ -32,6 +32,7 @@ from app.analysis.chord_history import ChordHistory
 from app.analysis.key_detector import KeyDetector, KeyResult, KrumhanslSchmucklerKeyDetector
 from app.analysis.key_history import KeyHistory
 from app.analysis.tempo_detector import OnsetTempoDetector, TempoResult
+from app.analysis.chart_harmony_aligner import BeatChroma, align_chart_to_beats
 from app.music.musical_context import MusicalContext
 from app.music.chord_chart import parse_chord
 from app.music.musical_clock import MusicalClock
@@ -94,6 +95,13 @@ class AudioAnalyzer:
         # acoplar-se a um relógio interno possivelmente dessincronizado.
         self._expected_chord = None
         self._key_hint = None
+
+        # Pré-análise harmônica do arquivo e cifra alinhada a ele (baixo em modo cifra).
+        self._beat_chroma: Optional[BeatChroma] = None
+        self._timeline_key: Optional[tuple] = None
+        self._timeline_job_key: Optional[tuple] = None
+        self._timeline_refs: tuple = ()
+        self._pending_timeline: Optional[tuple] = None
 
 
     @property
@@ -289,17 +297,90 @@ class AudioAnalyzer:
             self._context_manager.context.bpm = bpm
             return bpm
 
-    def reset_musical_history(self) -> None:
-        """Reinicia acumuladores de histórico, relógio e instrumentos ao carregar nova música ou dar stop."""
+    def reset_musical_history(self, keep_track_analysis: bool = False) -> None:
+        """Reinicia acumuladores de histórico, relógio e instrumentos ao carregar nova música ou dar stop.
+
+        ``keep_track_analysis`` (stop da MESMA faixa) preserva a pré-análise do
+        arquivo — grade de batidas e harmonia por batida. Antes o stop apagava a
+        grade e o play seguinte ficava só com a detecção ao vivo, atrasada.
+        """
         with self._lock:
             self._active_session = None
-            self._tempo_detector.reset()
+            if keep_track_analysis:
+                self._tempo_detector.reset_live_state()
+            else:
+                self._tempo_detector.reset()
+                self.set_beat_chroma(None)
             self._active_note_tracker.reset()
             self._key_detector.reset()
             self._harmonic_analyzer.reset()
             self._context_manager.reset()
             self._structure_analyzer.reset()
             self._band.reset_all()
+
+    def set_beat_chroma(self, beat_chroma: Optional[BeatChroma]) -> None:
+        """Instala a harmonia por batida do arquivo atual (ou None ao trocar de faixa)."""
+        with self._lock:
+            self._beat_chroma = beat_chroma
+            self._timeline_key = None
+            self._timeline_job_key = None
+            self._timeline_refs = ()
+            self._pending_timeline = None
+            self._bass_player.set_harmony_timeline(None)
+
+    def prepare_harmony_timeline(self, session: Optional["SongSession"],
+                                 wait: bool = False) -> None:
+        """Garante que a cifra da sessão esteja (ou vá ficar) alinhada ao áudio."""
+        with self._lock:
+            job = self._refresh_harmony_timeline(session)
+        if job is not None and wait:
+            job.join()
+            with self._lock:
+                self._refresh_harmony_timeline(session)
+
+    def _refresh_harmony_timeline(self, session: Optional["SongSession"]) -> Optional[threading.Thread]:
+        """Aplica/solicita o alinhamento cifra↔áudio; retorna a thread se iniciou uma."""
+        beat_chroma = self._beat_chroma
+        if beat_chroma is None or session is None or not session.alignment.event_count:
+            if self._timeline_key is not None or self._bass_player.harmony_timeline is not None:
+                self._timeline_key = None
+                self._bass_player.set_harmony_timeline(None)
+            return None
+        alignment = session.alignment
+        beats_per_bar = self._context_manager.clock.beats_per_bar
+        capo = session.chart.capo_semitones
+        key = (id(beat_chroma), id(alignment), capo, beats_per_bar)
+        if key == self._timeline_key:
+            return None
+        pending = self._pending_timeline
+        if pending is not None and pending[0] == key:
+            self._pending_timeline = None
+            self._timeline_key = key
+            self._bass_player.set_harmony_timeline(pending[1])
+            return None
+        if self._timeline_job_key == key:
+            return None
+        # Cifra/áudio mudaram: até o novo alinhamento ficar pronto, o baixo segue
+        # o cursor publicado da cifra (nunca um alinhamento de outra cifra).
+        self._timeline_key = None
+        self._bass_player.set_harmony_timeline(None)
+        self._timeline_job_key = key
+        self._timeline_refs = (beat_chroma, alignment)  # mantém os ids da chave válidos
+        job = threading.Thread(
+            target=self._align_in_background,
+            args=(key, beat_chroma, alignment.event_chords(), beats_per_bar, capo,
+                  alignment.section_start_events()),
+            daemon=True)
+        job.start()
+        return job
+
+    def _align_in_background(self, key, beat_chroma, chords, beats_per_bar, capo, starts) -> None:
+        try:
+            timeline = align_chart_to_beats(beat_chroma, chords, beats_per_bar, capo, starts)
+        except Exception:
+            logger.exception("Falha ao alinhar a cifra ao áudio")
+            timeline = None
+        self._pending_timeline = (key, timeline)
 
     def update_audio_format(self, sample_rate: int, chunk_size: int,
                             capture_latency_ms: float = 0.0,
@@ -403,6 +484,7 @@ class AudioAnalyzer:
                 self._structure_analyzer.update_online(
                     ctx, self._context_manager.chord_history,
                     self._context_manager.key_history, self._context_manager.clock)
+            self._refresh_harmony_timeline(session)
             if players is not None:
                 players.dispatch_context(ctx)
             else:

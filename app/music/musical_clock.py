@@ -35,6 +35,10 @@ class MusicalClock:
         self._tracking_state = "HOLDOVER"
         self._meter = meter
         self._beats_per_bar, self._beat_unit = self._parse_meter(meter)
+        # Em que batida do áudio cai o TEMPO 1 da música (em batidas desde t=0).
+        # Sem isso, os compassos eram numerados a partir de t=0: uma introdução
+        # com silêncio ou contagem deslocava todas as barras de compasso.
+        self._downbeat_offset: float = 0.0
 
         # Estado rítmico instantâneo
         self._elapsed_time: float = 0.0
@@ -87,6 +91,39 @@ class MusicalClock:
     def total_beats(self) -> float:
         """Coordenada musical contínua usada para duração harmônica, nunca em segundos."""
         return self._total_beats
+
+    @property
+    def downbeat_offset(self) -> float:
+        """Batida (desde t=0) que é o tempo 1 do compasso 1 da música."""
+        return self._downbeat_offset
+
+    def beats_at(self, timestamp: float) -> float:
+        """Coordenada em batidas (desde t=0) de um instante próximo ao atual."""
+        return self._total_beats - (self._elapsed_time - float(timestamp)) / self.beat_duration
+
+    def align_downbeat_at(self, timestamp: float, snap_phase: bool = False) -> None:
+        """Faz da batida mais próxima de ``timestamp`` o tempo 1 do compasso 1.
+
+        Sem ``snap_phase`` só a numeração de compassos/tempos muda. Com
+        ``snap_phase`` (quando ``timestamp`` é uma batida REAL observada no áudio),
+        a fase do relógio também é fixada nela: se a música entra no meio de uma
+        batida da grade que começou em t=0 (ex.: 3,5 batidas de silêncio), o
+        arredondamento sozinho escolheria a batida vizinha e deslocaria tudo.
+        """
+        beats = self.beats_at(timestamp)
+        if snap_phase:
+            nearest = math.floor(beats + 0.5)
+            self._total_beats += nearest - beats
+            beats = float(nearest)
+            self._phase_error_ms = 0.0
+            # A batida ancorada vale como pulso observado. Sem isso, enquanto nenhum
+            # pulso tivesse sido visto, update() recalcularia total_beats a partir do
+            # tempo decorrido e apagaria este ajuste de fase no tick seguinte.
+            self._last_observation = float(timestamp)
+            self._tracking_state = "TRACKING"
+            self._phase_confidence = max(self._phase_confidence, 0.8)
+        self._downbeat_offset = float(math.floor(beats + 0.5))
+        self.update(self._elapsed_time)
 
     @property
     def tempo_confidence(self) -> float:
@@ -182,6 +219,7 @@ class MusicalClock:
         self._phase_confidence = 0.0
         self._phase_error_ms = 0.0
         self._tracking_state = "HOLDOVER"
+        self._downbeat_offset = 0.0
 
     def seek(self, timestamp: float) -> None:
         """Move o relógio diretamente para o timestamp especificado."""
@@ -203,8 +241,11 @@ class MusicalClock:
             self.bpm = bpm
         dt = self._elapsed_time - previous_time
         if dt < -0.01:
-            # Seek da fonte: descarta observações que pertenciam ao trecho anterior.
+            # Seek da fonte: descarta observações que pertenciam ao trecho anterior,
+            # mas preserva onde cai o tempo 1 (é propriedade da música, não da leitura).
+            downbeat_offset = self._downbeat_offset
             self.reset()
+            self._downbeat_offset = downbeat_offset
             self._elapsed_time = max(0.0, float(timestamp))
             dt = self._elapsed_time
         if self._last_observation is None:
@@ -241,7 +282,7 @@ class MusicalClock:
         # Total de batidas decorridas desde o início (com precisão de ponto flutuante)
         # Adicionar epsilon para evitar imprecisão numérica em múltiplos exatos (ex: 0.500000000001)
         eps = 1e-6
-        total_beats = self._total_beats + eps
+        total_beats = self._total_beats - self._downbeat_offset + eps
 
         # Compasso (1-indexado)
         self._bar = int(total_beats // self._beats_per_bar) + 1
