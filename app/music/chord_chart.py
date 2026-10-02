@@ -5,8 +5,11 @@ inversões, graus harmônicos, sinônimos, repetições e segmentos de letra.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, TYPE_CHECKING
 import re
+
+if TYPE_CHECKING:  # evita ciclo de import (key_timeline usa theory/transposition)
+    from app.music.key_timeline import KeyChangeEvent, KeyTimeline
 
 from app.music.theory import PITCH_CLASSES, ENHARMONIC_MAP, get_chord_notes
 from app.music.harmonic_normalization import ROMAN_MAJOR, ROMAN_MINOR
@@ -305,6 +308,17 @@ class ChordChart:
     raw_text: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
     line_map: List[ChartLineInfo] = field(default_factory=list)
+    # Modulações declaradas na cifra ("Tom: A" depois que a música começou).
+    key_changes: List["KeyChangeEvent"] = field(default_factory=list)
+
+    @property
+    def key_timeline(self) -> "KeyTimeline":
+        """Tom vigente em cada compasso escrito: tom inicial + modulações em ordem."""
+        from app.music.key_timeline import KeyTimeline
+        return KeyTimeline(self.key, list(self.key_changes))
+
+    def key_at(self, bar: int, beat: float = 1.0) -> str:
+        return self.key_timeline.key_at(bar, beat) if self.key_changes else self.key
 
     @property
     def capo_semitones(self) -> int:
@@ -374,6 +388,11 @@ class ChordChart:
                     lm.chords = [transpose_chord_symbol(c, semitones, use_flats) for c in lm.chords]
             if self.raw_text:
                 self.raw_text = transpose_text_block(self.raw_text, semitones, use_flats)
+            # As modulações andam junto: G → A → Bb transposto +2 vira A → B → C.
+            from app.music.key_timeline import transpose_event
+            self.key_changes = [transpose_event(e, semitones, use_flats) for e in self.key_changes]
+            if self.key_changes:
+                self.key_changes[0].from_key = target_key
 
         self.key = target_key
         self.metadata["transposed_semitones"] = int(self.metadata.get("transposed_semitones", 0) + semitones) % 12
@@ -452,13 +471,16 @@ class ChordChart:
             "raw_text": self.raw_text,
             "metadata": dict(self.metadata),
             "line_map": [lm.to_dict() for lm in self.line_map],
+            "key_changes": [event.to_dict() for event in self.key_changes],
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChordChart":
+        from app.music.key_timeline import KeyChangeEvent
         sec_raw = data.get("sections", [])
         line_map_raw = data.get("line_map", [])
         return cls(
+            key_changes=[KeyChangeEvent.from_dict(e) for e in data.get("key_changes", [])],
             title=data.get("title", "Sem Título"),
             artist=data.get("artist", "Artista Desconhecido"),
             key=data.get("key", "C Major"),

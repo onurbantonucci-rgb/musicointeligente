@@ -20,8 +20,12 @@ class TranspositionTracker:
     """Infere um deslocamento global de semitons entre a cifra e a execução."""
 
     def __init__(self, window: int = 8, min_observations: int = 3, min_ratio: float = 0.6):
-        # Janela de observações recentes (delta de semitons por acorde confiável)
+        # Janela de observações recentes: (delta de semitons, tônica esperada) por PAR
+        # (esperado, detectado) distinto. O tracker é alimentado a cada quadro; contar
+        # quadros fazia um único acorde fora do lugar (cursor atrasado na cifra) virar
+        # uma "transposição" que confirmava qualquer coisa e escondia a perda de posição.
         self._deltas: deque = deque(maxlen=window)
+        self._last_pair = None
         self._min_observations = min_observations
         self._min_ratio = min_ratio
         self._offset: int = 0  # Deslocamento consolidado atual (0 = sem transposição)
@@ -29,6 +33,7 @@ class TranspositionTracker:
     def reset(self) -> None:
         """Zera o histórico e o deslocamento consolidado."""
         self._deltas.clear()
+        self._last_pair = None
         self._offset = 0
 
     @property
@@ -50,8 +55,11 @@ class TranspositionTracker:
         if exp_pc < 0 or det_pc < 0:
             return self._offset
 
-        delta = (det_pc - exp_pc) % 12
-        self._deltas.append(delta)
+        pair = (exp_pc, det_pc)
+        if pair == self._last_pair:
+            return self._offset
+        self._last_pair = pair
+        self._deltas.append(((det_pc - exp_pc) % 12, exp_pc))
         self._consolidate()
         return self._offset
 
@@ -61,12 +69,16 @@ class TranspositionTracker:
             self._offset = 0
             return
 
-        counts = Counter(self._deltas)
+        counts = Counter(delta for delta, _ in self._deltas)
         best_delta, best_count = counts.most_common(1)[0]
         ratio = best_count / len(self._deltas)
+        # Transposição desloca a MÚSICA inteira: o mesmo intervalo precisa aparecer em
+        # acordes esperados diferentes, não num só acorde esperado ouvido de vários jeitos.
+        distinct_expected = len({root for delta, root in self._deltas if delta == best_delta})
 
         # Só assume transposição quando um mesmo deslocamento NÃO-zero domina a janela.
-        if best_delta != 0 and best_count >= self._min_observations and ratio >= self._min_ratio:
+        if (best_delta != 0 and best_count >= self._min_observations and ratio >= self._min_ratio
+                and distinct_expected >= self._min_observations):
             # Normaliza para o intervalo mais próximo de zero: +7 é mais natural como -5, etc.
             self._offset = best_delta - 12 if best_delta > 6 else best_delta
         else:

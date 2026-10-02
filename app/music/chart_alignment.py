@@ -228,6 +228,69 @@ class ChartAlignment:
         """Símbolos dos acordes na ordem real da cifra (repetições expandidas)."""
         return [entry[1].symbol.original_symbol for entry in self._timeline_chords]
 
+    def event_section_types(self) -> List[str]:
+        """Tipo de seção (INTRO, VERSE, CHORUS...) de cada evento da cifra."""
+        return [str(entry[2].section_type or "UNKNOWN").upper() for entry in self._timeline_chords]
+
+    def event_section_labels(self) -> List[str]:
+        """"Nome da seção#ocorrência" de cada evento (ex.: "Refrão#2")."""
+        return [f"{entry[2].name}#{entry[4]}" for entry in self._timeline_chords]
+
+    def event_keys(self) -> List[str]:
+        """Tom vigente (soante, como escrito em "Tom:") em cada evento da cifra."""
+        if not self._chart or not self._timeline_chords:
+            return []
+        cache_key = (self._chart.key, tuple((e.anchor_bar, e.anchor_beat, e.to_key)
+                                            for e in self._chart.key_changes))
+        if getattr(self, "_event_keys_cache", (None, None))[0] != cache_key:
+            if not self._chart.key_changes:
+                keys = [self._chart.key] * len(self._timeline_chords)
+            else:
+                timeline = self._chart.key_timeline
+                keys = [timeline.key_at(int(entry[1].bar), float(entry[1].beat))
+                        for entry in self._timeline_chords]
+            self._event_keys_cache = (cache_key, keys)
+        return self._event_keys_cache[1]
+
+    def key_at_event(self, event_index: int) -> str:
+        keys = self.event_keys()
+        if not keys:
+            return self._chart.key if self._chart else "--"
+        return keys[max(0, min(len(keys) - 1, int(event_index)))]
+
+    def next_key_change(self, event_index: int) -> Optional[Tuple[int, str]]:
+        """(evento onde o tom muda, novo tom) depois de ``event_index``, ou None."""
+        keys = self.event_keys()
+        if not keys or not self._chart.key_changes:
+            return None
+        index = max(0, min(len(keys) - 1, int(event_index)))
+        for later in range(index + 1, len(keys)):
+            if keys[later] != keys[index]:
+                return later, keys[later]
+        return None
+
+    def event_bar(self, event_index: int) -> int:
+        """Compasso da timeline (repetições expandidas) em que o evento começa."""
+        if not self._timeline_chords:
+            return 1
+        return self._timeline_chords[max(0, min(len(self._timeline_chords) - 1, int(event_index)))][0]
+
+    def event_entry(self, event_index: int):
+        """(acorde da cifra, seção) do evento da timeline, ou None."""
+        if not self._timeline_chords:
+            return None
+        entry = self._timeline_chords[max(0, min(len(self._timeline_chords) - 1, int(event_index)))]
+        return entry[1], entry[2]
+
+    def bars_for_chart_bar(self, chart_bar: int) -> List[int]:
+        """Compassos da timeline (com repetições expandidas) do compasso escrito ``chart_bar``.
+
+        A letra guarda o compasso ESCRITO (sem repetições); uma seção "2x" faz o
+        mesmo compasso escrito aparecer duas vezes na execução.
+        """
+        bars = [entry[0] for entry in self._timeline_chords if int(entry[1].bar) == int(chart_bar)]
+        return sorted(set(bars))
+
     def section_start_events(self) -> List[int]:
         """Índices de evento onde começa cada ocorrência de seção."""
         return [index for index, entry in enumerate(self._timeline_chords) if entry[5] == 0]

@@ -26,7 +26,8 @@ class TestPerformanceState(unittest.TestCase):
     def make_playing(self, session):
         session.update_audio_tick(0.0, detected_chord="C", detected_confidence=.9,
                                   source_context=self.source(.1))
-        self.assertEqual(session.performance_state, PerformanceState.RECOVERING.value)
+        # Portão de início: o 1º acorde da cifra precisa se manter um instante.
+        self.assertEqual(session.performance_state, PerformanceState.WAITING.value)
         session.update_audio_tick(2.0, detected_chord="C", detected_confidence=.9,
                                   source_context=self.source(.1))
         self.assertEqual(session.performance_state, PerformanceState.PLAYING.value)
@@ -126,6 +127,7 @@ class TestPerformanceState(unittest.TestCase):
         self.assertEqual(session.performance_state, PerformanceState.WAITING.value)
         session.update_audio_tick(0.0, detected_chord="C", detected_confidence=.9,
                                   source_context=self.source(.1))
+        # Retomada sem reiniciar a sessão: a música já tinha começado (sem portão).
         self.assertEqual(session.performance_state, PerformanceState.RECOVERING.value)
 
 

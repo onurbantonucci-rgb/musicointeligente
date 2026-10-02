@@ -188,6 +188,93 @@ def _label_blocks(blocks: List[_Block]) -> List[str]:
     return types
 
 
+def _minimal_period(seq: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Menor unidade que, repetida, forma a sequência (D C D C -> D C)."""
+    for size in range(1, len(seq) + 1):
+        if len(seq) % size == 0 and seq == seq[:size] * (len(seq) // size):
+            return seq[:size]
+    return seq
+
+
+def _line_chords(line: str) -> Tuple[str, ...]:
+    """Acordes canônicos de uma linha de acordes (ou do resto de um cabeçalho inline)."""
+    Classifier, SemLineType = _classifier()
+    ct = Classifier.classify_line(line)
+    if ct.line_type != SemLineType.CHORD:
+        return ()
+    return tuple(parse_chord(tok).canonical_name for tok, _pos in ct.chord_tokens)
+
+
+def split_chord_only_passages(text: str) -> str:
+    """Separa em bloco próprio as passagens SÓ DE ACORDES que fecham uma seção com letra.
+
+    No Cifra Club a volta da introdução (ou um trecho instrumental) costuma vir no fim
+    do bloco cantado, sem cabeçalho próprio — ex.: "( D#m  C#4  B9  F# )" logo depois da
+    última linha do Refrão. Sem um cabeçalho, o trecho fica grudado no Refrão e não dá
+    para editá-lo/movê-lo como um bloco. Aqui ele ganha um cabeçalho: [Reintro] quando
+    repete a progressão da Intro, senão [Instrumental].
+
+    Só separa o que vem DEPOIS da última linha de letra da seção e é só de acordes,
+    e somente quando o trecho está destacado da letra (linha em branco antes ou acordes
+    entre parênteses) — acordes logo abaixo da letra continuam sendo o fim da frase.
+    """
+    if not text or not text.strip():
+        return text
+    Classifier, SemLineType = _classifier()
+    from app.input.chart_parser import ChartParser
+
+    lines = text.split("\n")
+    headers = [i for i, ln in enumerate(lines) if ChartParser.parse_section_header(ln.strip())]
+    if not headers:
+        return text
+
+    intro_unit: Tuple[str, ...] = ()
+    for pos, h in enumerate(headers):
+        _name, sec_type = ChartParser.parse_section_header(lines[h].strip())
+        if sec_type != "INTRO":
+            continue
+        end = headers[pos + 1] if pos + 1 < len(headers) else len(lines)
+        inline = lines[h].strip()
+        chords = _line_chords(inline[inline.index("]") + 1:]) if inline.startswith("[") else ()
+        for ln in lines[h + 1:end]:
+            chords += _line_chords(ln)
+        if chords:                      # [Tab - Intro] só com tablatura não define a progressão
+            intro_unit = _minimal_period(chords)
+            break
+
+    inserts: Dict[int, str] = {}
+    for pos, h in enumerate(headers):
+        end = headers[pos + 1] if pos + 1 < len(headers) else len(lines)
+        kinds = [Classifier.classify_line(lines[i]).line_type for i in range(h + 1, end)]
+        lyric_rows = [h + 1 + k for k, kind in enumerate(kinds) if kind == SemLineType.LYRIC]
+        if not lyric_rows:
+            continue
+        tail = [i for i in range(lyric_rows[-1] + 1, end) if lines[i].strip()]
+        if not tail or any(Classifier.classify_line(lines[i]).line_type != SemLineType.CHORD
+                           for i in tail):
+            continue
+        chords: Tuple[str, ...] = ()
+        for i in tail:
+            chords += _line_chords(lines[i])
+        detached = tail[0] > lyric_rows[-1] + 1
+        bracketed = all(lines[i].strip().startswith("(") for i in tail)
+        if len(chords) < 2 or not (detached or bracketed):
+            continue
+        is_reintro = bool(intro_unit) and _minimal_period(chords) == intro_unit
+        inserts[tail[0]] = "[Reintro]" if is_reintro else "[Instrumental]"
+
+    if not inserts:
+        return text
+    out: List[str] = []
+    for i, ln in enumerate(lines):
+        if i in inserts:
+            if out and out[-1].strip():
+                out.append("")
+            out.append(inserts[i])
+        out.append(ln)
+    return "\n".join(out)
+
+
 def auto_sectionize_text(text: str) -> str:
     """Insere cabeçalhos de seção em uma cifra sem marcação e retorna o novo texto.
 

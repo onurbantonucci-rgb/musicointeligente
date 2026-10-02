@@ -1499,6 +1499,25 @@ class MainWindow:
         self.lbl_playalong_fusion.pack(anchor="w")
         self.lbl_playalong_fusion_sub = tk.Label(c_fus, text="Áudio confirmando", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 8))
         self.lbl_playalong_fusion_sub.pack(anchor="w")
+        self._hud_metrics = hud_metrics
+
+        # Cartão da LETRA (só com a opção "Seguir a letra" ligada): a linha sendo
+        # cantada, com o trecho sobre o acorde atual em destaque, e a próxima linha.
+        self.frame_playalong_lyrics = tk.Frame(right_pane, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
+        tk.Label(self.frame_playalong_lyrics, text="🎤 LETRA (CANTANDO AGORA)", bg="#141820", fg="#8c9ba5",
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.text_playalong_lyric = tk.Text(
+            self.frame_playalong_lyrics, height=1, bg="#141820", fg="#c9d4df", bd=0,
+            highlightthickness=0, font=("Segoe UI", 15, "bold"), wrap="none", cursor="arrow")
+        self.text_playalong_lyric.tag_configure("sung_now", foreground="#ffd166",
+                                                 background="#3a2f0b")
+        self.text_playalong_lyric.pack(fill="x")
+        self.text_playalong_lyric.configure(state="disabled")
+        self.lbl_playalong_next_lyric = tk.Label(self.frame_playalong_lyrics, text="", bg="#141820",
+                                                 fg="#5a6677", font=("Segoe UI", 9), anchor="w")
+        self.lbl_playalong_next_lyric.pack(anchor="w", fill="x")
+        self._lyrics_card_visible = False
+        self._last_lyric_view = None
 
         # Barra de Ações Rápidas de Edição Direta da Cifra
         chart_edit_bar = tk.Frame(right_pane, bg="#181d26", padx=8, pady=4, bd=1, relief="solid")
@@ -1569,6 +1588,11 @@ class MainWindow:
         )
         btn_recolor_chart.pack(side="left", padx=3)
 
+        tk.Button(chart_edit_bar, text="🎵 Mudança de tom", bg="#202735", fg="#c792ea",
+                  activebackground="#2a3344", activeforeground="#c792ea",
+                  font=("Segoe UI", 8), relief="flat", padx=8, pady=2, cursor="hand2",
+                  command=self._on_insert_key_change).pack(side="left", padx=3)
+
         # --- Seletor de Tom (transposição da cifra inteira) ---
         tk.Label(chart_edit_bar, text="  🎚 Tom:", bg="#181d26", fg="#00d2ff",
                  font=("Segoe UI", 8, "bold")).pack(side="left", padx=(6, 2))
@@ -1632,6 +1656,9 @@ class MainWindow:
         self.text_chart_view.tag_configure("lyric_line", foreground="#f0f4f8", font=("Consolas", 11))
         self.text_chart_view.tag_configure("active_chord", background="#0f4c81", foreground="#ffffff", font=("Consolas", 12, "bold"))
         self.text_chart_view.tag_configure("active_line", background="#1a2738")
+        # Trecho da letra sendo cantado (opção "Seguir a letra"), como o acorde ativo.
+        self.text_chart_view.tag_configure("active_lyric", background="#3a2f0b", foreground="#ffd166",
+                                           font=("Consolas", 12, "bold"))
 
         # Tags de FUNDO por TIPO de seção (Intro/Verso/Refrão/Ponte…): o BLOCO inteiro
         # recebe um fundo tingido na cor da seção (suave para o corpo, mais forte no
@@ -2226,12 +2253,97 @@ class MainWindow:
             else:
                 v.tag_add("lyric_line", f"{line_num}.0", f"{line_num}.end")
 
+        self._mark_key_changes(text)
+
         # Mantém os destaques de reprodução acima dos fundos de bloco
         for t in ("active_line", "active_chord"):
             try:
                 v.tag_raise(t)
             except Exception:
                 pass
+
+    # ==================================================================
+    # Mudanças de tom (modulações) no editor
+    # ==================================================================
+    _KEY_ROOTS = ("C", "C#", "Db", "D", "D#", "Eb", "E", "F", "F#", "Gb", "G", "G#", "Ab",
+                  "A", "A#", "Bb", "B")
+
+    def _mark_key_changes(self, text: str) -> None:
+        """Marca discretamente cada modulação: ──── MODULAÇÃO: G → A ──── (sem tocar no texto)."""
+        v = self.text_chart_view
+        for label in getattr(self, "_key_change_labels", []):
+            try:
+                label.destroy()
+            except Exception:
+                pass
+        self._key_change_labels = []
+        try:
+            v.tag_configure("key_change_line", foreground="#c792ea", font=("Consolas", 11, "bold"))
+            v.tag_remove("key_change_line", "1.0", "end")
+            changes = ChartParser.parse(text).key_changes
+        except Exception:
+            return
+        for event in changes:
+            line = event.source_line_number
+            if line <= 0:
+                continue
+            v.tag_add("key_change_line", f"{line}.0", f"{line}.end")
+            names = [k.replace(" Major", "").replace(" Minor", "m") for k in (event.from_key, event.to_key)]
+            label = tk.Label(v, text=f"  ──── MODULAÇÃO: {names[0]} → {names[1]} ────",
+                             bg=v.cget("bg"), fg="#c792ea", font=("Segoe UI", 8, "bold"))
+            try:
+                v.window_create(f"{line}.end", window=label)
+                self._key_change_labels.append(label)
+            except Exception:
+                label.destroy()
+
+    def _key_change_insert_line(self) -> int:
+        """Linha onde inserir "Tom: X": antes do acorde que inicia o novo tom."""
+        v = self.text_chart_view
+        try:
+            line = int(v.index("insert").split(".")[0])
+        except Exception:
+            return 1
+        current = v.get(f"{line}.0", f"{line}.end")
+        if line > 1 and current.strip() and not ChartParser.is_chord_line(current.strip()):
+            previous = v.get(f"{line - 1}.0", f"{line - 1}.end").strip()
+            if previous and ChartParser.is_chord_line(previous):
+                return line - 1          # cursor na letra: a mudança vale a partir do acorde dela
+        return line
+
+    def _on_insert_key_change(self) -> None:
+        """Diálogo: escolhe o novo tom e insere "Tom: X" no ponto do cursor."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Inserir mudança de tom")
+        dlg.configure(bg="#141820")
+        dlg.transient(self.root)
+        tk.Label(dlg, text="Novo tom a partir do acorde da linha do cursor:", bg="#141820",
+                 fg="#f0f4f8", font=("Segoe UI", 9)).grid(row=0, column=0, columnspan=2,
+                                                          padx=12, pady=(10, 6), sticky="w")
+        var_root = tk.StringVar(value="A")
+        var_mode = tk.StringVar(value="Maior")
+        ttk.Combobox(dlg, textvariable=var_root, values=self._KEY_ROOTS, width=6,
+                     state="readonly").grid(row=1, column=0, padx=(12, 6), pady=4)
+        ttk.Combobox(dlg, textvariable=var_mode, values=("Maior", "Menor"), width=8,
+                     state="readonly").grid(row=1, column=1, padx=(0, 12), pady=4)
+
+        def confirm():
+            self.insert_key_change(var_root.get(), var_mode.get() == "Menor")
+            dlg.destroy()
+
+        tk.Button(dlg, text="Inserir", bg="#00e676", fg="#0d1015", relief="flat",
+                  command=confirm).grid(row=2, column=0, columnspan=2, pady=(6, 10))
+        dlg.bind("<Return>", lambda e: confirm())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    def insert_key_change(self, root: str, minor: bool = False) -> int:
+        """Insere "Tom: X" antes da linha de acordes onde o novo tom começa; devolve a linha."""
+        line = self._key_change_insert_line()
+        marker = f"Tom: {root}{'m' if minor else ''}"
+        self.text_chart_view.insert(f"{line}.0", marker + "\n")
+        self._on_chart_key_release()
+        self._apply_chart_syntax_highlighting()
+        return line
 
     # ==================================================================
     # Tom (transposição) e Operações de Bloco
@@ -2711,10 +2823,56 @@ class MainWindow:
 
         if self._follow_mode_enabled:
             self._highlight_chart_position(session.chart_position)
+        self._update_lyrics_display(session)
         if getattr(self, "_bass_debug_visible", False):
             self.lbl_status_msg.config(text=session.format_position_diagnostics() + " | " +
                                        session.format_tempo_diagnostics())
 
+
+    def _update_lyrics_display(self, session: SongSession) -> None:
+        """Mostra a letra sendo cantada (cartão + destaque na cifra) quando a opção está ligada."""
+        analyzer = getattr(self, "analyzer", None)
+        if analyzer is None or not hasattr(self, "frame_playalong_lyrics"):
+            return
+        enabled = bool(getattr(analyzer, "lyrics_following", False))
+        if not enabled:
+            if self._lyrics_card_visible:
+                self.frame_playalong_lyrics.pack_forget()
+                self._lyrics_card_visible = False
+                self.text_chart_view.tag_remove("active_lyric", "1.0", "end")
+                self._last_lyric_view = None
+            return
+        if not self._lyrics_card_visible:
+            self.frame_playalong_lyrics.pack(fill="x", pady=(0, 4), after=self._hud_metrics)
+            self._lyrics_card_visible = True
+        view = session.lyric_view()
+        key = (view.state, view.line_number, view.segment, view.segment_start, view.next_line)
+        if key == self._last_lyric_view:
+            return
+        self._last_lyric_view = key
+        widget = self.text_playalong_lyric
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        if view.state == "cantando":
+            widget.insert("1.0", view.line_text.strip())
+            if view.segment and view.segment_start >= 0:
+                offset = len(view.line_text) - len(view.line_text.lstrip())
+                start = max(0, view.segment_start - offset)
+                widget.tag_add("sung_now", f"1.{start}", f"1.{start + len(view.segment)}")
+        elif view.state == "instrumental":
+            widget.insert("1.0", "♪ (instrumental)")
+        else:
+            widget.insert("1.0", "— cifra sem letra —")
+        widget.configure(state="disabled")
+        self.lbl_playalong_next_lyric.config(
+            text=f"→ {view.next_line}" if view.next_line else "")
+        # Destaque no texto da cifra, junto com o acorde ativo.
+        self.text_chart_view.tag_remove("active_lyric", "1.0", "end")
+        if view.state == "cantando" and view.segment and view.segment_start >= 0:
+            line = view.line_number
+            self.text_chart_view.tag_add(
+                "active_lyric", f"{line}.{view.segment_start}",
+                f"{line}.{view.segment_start + len(view.segment)}")
 
     def _on_close(self) -> None:
         try:

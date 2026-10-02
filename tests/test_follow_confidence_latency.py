@@ -54,9 +54,14 @@ class TestFollowConfidenceAndLatency(unittest.TestCase):
 
     def test_medium_confidence_uses_root_and_fifth_without_latency_anticipation(self):
         bass = BassPlayer(sample_rate=1000, pattern=BassPatternType.AUTO)
-        bass.on_musical_context(self.predictive_context(200, level="MEDIUM"))
+        context = self.predictive_context(200, level="MEDIUM")
+        context.beat = 4                    # próximo ataque: tempo 1 (todo padrão o toca)
+        bass.on_musical_context(context)
         queued = bass.synthesizer.scheduled_events[0]
-        self.assertEqual(bass.current_decision.pattern_type, BassPatternType.ROOT_FIFTH)
+        # Confiança média: no máximo tônica e quinta. A INTENÇÃO pode tocar menos
+        # (começo da música, trecho calmo), nunca arriscar mais.
+        self.assertIn(bass.current_decision.pattern_type,
+                      (BassPatternType.ROOT_FIFTH, BassPatternType.ROOT, BassPatternType.SUSTAINED))
         self.assertAlmostEqual(queued.scheduled_time, queued.musical_time, places=4)
 
     def test_low_confidence_does_not_anticipate_or_fill_weak_beats(self):

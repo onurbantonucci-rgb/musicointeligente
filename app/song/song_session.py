@@ -8,13 +8,15 @@ Garante isolamento hermético entre trocas de músicas para evitar memory leaks.
 from typing import Optional, Dict, Any, List
 import copy
 from dataclasses import fields
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from app.song.song import Song
 from app.music.musical_context import MusicalContext
 from app.music.musical_clock import MusicalClock
 from app.music.chord_chart import ChordChart, parse_chord
+from app.music.transposition import transpose_chord_symbol
+from app.music.theory import note_to_pc
 from app.input.chart_parser import ChartParser
 from app.input.chart_semantic_classifier import ChartSemanticClassifier
 from app.music.chart_alignment import ChartAlignment, ChartPosition, StartAnchor
@@ -22,9 +24,21 @@ from app.music.chart_audio_fusion import ChartAudioFusion, FusedMusicalState
 from app.analysis.music_structure_analyzer import MusicStructureAnalyzer
 from app.music.prediction_engine import PredictionEngine, MusicPrediction
 from app.music.position_estimator import PositionEstimator, TrackingState
+from app.music.online_chart_follower import OnlineChartFollower
 from app.analysis.tempo_detector import TempoResult
 from app.music.follow_confidence import calculate_follow_confidence
 from app.music.harmonic_rhythm import HarmonicRhythmTracker
+
+
+@dataclass
+class LyricView:
+    """O que está sendo cantado agora, para exibir como o acorde atual."""
+    state: str = "sem letra"        # "cantando", "instrumental" ou "sem letra"
+    line_number: int = 0            # linha física no texto da cifra (1 = primeira)
+    line_text: str = ""
+    segment: str = ""               # trecho cantado sobre o acorde atual
+    segment_start: int = -1         # coluna do trecho na linha (-1 = sem destaque)
+    next_line: str = ""
 
 
 class PerformanceState(str, Enum):
@@ -136,6 +150,20 @@ class SongSession:
         self._recovery_evidence = 0
         # O tempo 1 do relógio já foi alinhado ao primeiro ataque da música?
         self._downbeat_anchored = False
+        # Portão de início: a música só "começa" quando o áudio confirma o PRIMEIRO
+        # acorde da cifra (contagem da bateria, ruído ou outra nota são ignorados).
+        self._music_started = False
+        self._lyrics_status = "Letra: aguardando voz"
+        self._start_candidate_since: Optional[float] = None
+        self._start_onset: Optional[float] = None
+        self._harmonic_without_start = 0.0
+        self._last_gate_tick: Optional[float] = None
+        # Seguidor probabilístico (HMM causal): alcança a banda quando trocas de acorde
+        # não foram detectadas, em vez de esperar o acorde voltar no ciclo seguinte.
+        self._chart_follower: Optional[OnlineChartFollower] = None
+        self._chart_follower_key = None
+        self._follower_cursor = -1
+        self._follower_candidate = (-1, 0)
         self._current_chart_pos: ChartPosition = self._position_estimator.refresh_position()
         self._last_confident_chart_pos = self._current_chart_pos
         self._current_fused_state: FusedMusicalState = FusedMusicalState(
@@ -314,6 +342,16 @@ class SongSession:
         self._recovery_started_at = None
         self._recovery_evidence = 0
         self._downbeat_anchored = False
+        self._music_started = False
+        self._lyrics_status = "Letra: aguardando voz"
+        self._start_candidate_since = None
+        self._start_onset = None
+        self._harmonic_without_start = 0.0
+        self._last_gate_tick = None
+        if self._chart_follower is not None:
+            self._chart_follower.reset(None)
+        self._follower_cursor = -1
+        self._follower_candidate = (-1, 0)
         self._follow_stability = 0.70
         self._last_follow_timestamp = None
         self._follow_observations_available = False
@@ -409,6 +447,10 @@ class SongSession:
         if timestamp < self._clock.elapsed_time - 0.01:
             # Seek da fonte invalida o horário de qualquer evento preparado.
             self._position_generation += 1
+        if (not self._music_started and timestamp > 5.0 and
+                abs(timestamp - self._clock.elapsed_time) > 1.0 and self._clock.elapsed_time > 0.0):
+            # Seek para o meio da música: o portão de INÍCIO não se aplica.
+            self._music_started = True
         chart_bpm = self._chart_bpm()
         manual_bpm = self._song.performance_settings.bpm_override
         # A fonte de BPM é independente da fonte harmônica. Em Cifra não
@@ -469,9 +511,20 @@ class SongSession:
             transition_beat=observed_onset)
         activity = self._has_musical_activity(source_context, detected_chord,
                                                detected_confidence, tempo_result)
+        just_started = False
+        if not self._music_started and source_context is not None:
+            just_started = self._confirms_song_start(timestamp, detected_chord,
+                                                     detected_confidence, source_context)
+            if not just_started:
+                # Antes do primeiro acorde da cifra, nada conta como música.
+                activity = False
         previous_state = self._performance_state
         should_localize = self._update_performance_state(
             timestamp, activity, activity_observable=source_context is not None)
+        if just_started:
+            # Confirmado o primeiro acorde: entra tocando, sem esperar outro tempo 1.
+            self._set_performance_state(PerformanceState.PLAYING)
+            should_localize = True
         self._anchor_downbeat_on_music_start(previous_state, timestamp, source_context, tempo_result)
         if should_localize:
             old_offset = self._position_estimator.bar_offset
@@ -488,6 +541,8 @@ class SongSession:
                 audio_observable=source_context is not None)
             if self._position_estimator.bar_offset != old_offset:
                 self._position_generation += 1
+            if self._music_started and source_context is not None:
+                self._follow_chart_by_harmony(timestamp, source_context)
             if activity and self._current_chart_pos.confidence >= 0.50:
                 self._last_confident_chart_pos = self._current_chart_pos
         else:
@@ -523,7 +578,12 @@ class SongSession:
                 observed_beat = upcoming
             elif tempo_result.beat_timestamp is not None:
                 observed_beat = tempo_result.beat_timestamp
-        if observed_beat is not None:
+        if self._start_onset is not None:
+            # O primeiro acorde é confirmado alguns décimos depois de soar: o tempo 1
+            # é a batida (já rastreada, ex.: na contagem da bateria) mais próxima
+            # do instante em que ele SOOU.
+            self._clock.align_downbeat_at(self._start_onset)
+        elif observed_beat is not None:
             # Batida real da pré-análise: fixa fase e tempo 1 exatamente nela.
             self._clock.align_downbeat_at(observed_beat, snap_phase=True)
         else:
@@ -531,6 +591,262 @@ class SongSession:
         self._downbeat_anchored = True
         # Previsões feitas na numeração antiga de compassos não valem mais.
         self._position_generation += 1
+
+    # Tempo que o primeiro acorde precisa se manter para abrir o portão, e quanto
+    # tempo de harmonia SEM o primeiro acorde faz desistir de esperá-lo (gravação
+    # que começa em outro ponto da cifra: a localização global assume).
+    _START_HOLD_SECONDS = 0.25
+    _START_GIVE_UP_SECONDS = 12.0
+
+    def _start_chords(self) -> List[str]:
+        anchor = self._alignment.start_anchor
+        if anchor is None:
+            return []
+        chords = [anchor.chord]
+        capo = self._chart.capo_semitones or self._position_estimator.capo_semitones
+        if capo:
+            chords.append(transpose_chord_symbol(anchor.chord, capo))
+        return chords
+
+    def _confirms_song_start(self, timestamp: float, chord: str, confidence: float,
+                             source_context: MusicalContext) -> bool:
+        """O áudio está tocando o PRIMEIRO acorde da cifra, de forma estável?"""
+        dt = 0.0 if self._last_gate_tick is None else max(0.0, timestamp - self._last_gate_tick)
+        self._last_gate_tick = timestamp
+        expected = self._start_chords()
+        if not expected:
+            self._music_started = True
+            return True
+        harmonic = chord not in ("", "--", "UNKNOWN", "N") and confidence >= 0.45
+        roots = {parse_chord(c).root for c in expected}
+        matches = harmonic and parse_chord(chord).root in roots
+        if not matches and not harmonic:
+            # Começo dedilhado/arpejado: notas do PRIMEIRO acorde, começando pela
+            # fundamental, também confirmam o início.
+            note = getattr(source_context, "note", "--") or "--"
+            note_ok = getattr(source_context, "note_confidence", 0.0) >= 0.6 and note != "--"
+            if note_ok:
+                pc = note_to_pc(note.rstrip("0123456789-"))
+                tones = {pc_ for c in expected for pc_ in self._chord_pitch_classes(c)}
+                root_pcs = {note_to_pc(r) for r in roots}
+                matches = pc in root_pcs or (self._start_candidate_since is not None and pc in tones)
+                harmonic = matches
+        if not matches:
+            self._start_candidate_since = None
+            if harmonic:
+                self._harmonic_without_start += dt
+                if self._harmonic_without_start >= self._START_GIVE_UP_SECONDS:
+                    # Começou em outro ponto: libera e deixa a localização achar onde.
+                    self._music_started = True
+                    self._start_onset = None
+                    return True
+            return False
+        if chord not in ("", "--", "UNKNOWN", "N"):
+            self._position_estimator.observe_start_chord(chord, confidence)
+        onset = source_context.chord_start_time
+        if self._start_candidate_since is None:
+            self._start_candidate_since = timestamp
+            self._start_onset = onset if 0.0 <= timestamp - onset <= 1.5 else timestamp
+        if timestamp - self._start_candidate_since + dt < self._START_HOLD_SECONDS:
+            return False
+        self._music_started = True
+        return True
+
+    @staticmethod
+    def _chord_pitch_classes(chord: str) -> set:
+        symbol = parse_chord(chord)
+        root = note_to_pc(symbol.root)
+        third = 3 if symbol.quality in ("minor", "dim") else 4
+        fifth = 6 if symbol.quality == "dim" else 8 if symbol.quality == "aug" else 7
+        return {root, (root + third) % 12, (root + fifth) % 12}
+
+    @property
+    def music_started(self) -> bool:
+        return self._music_started
+
+    @property
+    def lyrics_status(self) -> str:
+        return self._lyrics_status
+
+    def _harmonic_refinement(self, target: int) -> int:
+        """A letra diz a PARTE da música; o acorde que soa agora escolhe o compasso exato.
+
+        Palavras são cantadas no acorde sob elas ou um pouco antes: entre o
+        compasso da palavra e o anterior, fica o do acorde que o áudio toca.
+        """
+        heard = self._context.smoothed_detected_chord or "--"
+        if heard in ("", "--", "UNKNOWN", "N"):
+            return max(1, target - 1)
+        root = parse_chord(heard).root
+        # O cantor canta a palavra NO acorde dela ou um pouco ANTES — nunca um
+        # compasso depois. Na dúvida, o compasso anterior: o baixo segue no acorde
+        # atual e troca quando a troca for ouvida (trocar cedo soaria errado).
+        for bar in (target, target - 1):
+            if bar < 1:
+                continue
+            chord = self._alignment.get_position_at(bar).current_chord
+            if chord and chord != "--" and {parse_chord(c).root for c in
+                                            [chord, transpose_chord_symbol(chord, self._chart.capo_semitones)]} & {root}:
+                return bar
+        return max(1, target - 1)
+
+    def lyric_view(self) -> LyricView:
+        """Letra no ponto atual da cifra: linha, trecho sob o acorde e próxima linha."""
+        entry = self._alignment.event_entry(self._current_chart_pos.event_index)
+        if entry is None:
+            return LyricView()
+        chord, section = entry
+        segments = [s for sec in self._chart.sections for s in sec.lyrics]
+        if not segments:
+            return LyricView()
+        same_section = [s for s in section.lyrics]
+        current = [s for s in same_section if s.bar_offset == chord.bar]
+        current.sort(key=lambda s: (not s.chord_symbol, s.line_number))
+        holding = False
+        if not current:
+            # Acorde sem sílaba nova: a frase anterior ainda está soando (até 2 compassos).
+            recent = [s for s in same_section if chord.bar - 2 <= s.bar_offset < chord.bar]
+            if not recent:
+                return LyricView(state="instrumental",
+                                 next_line=self._next_lyric_line(segments, chord.line_number))
+            current = [max(recent, key=lambda s: (s.bar_offset, s.line_number))]
+            holding = True
+        segment = current[0]
+        lines = (self._chart.raw_text or "").split("\n")
+        line_text = (lines[segment.line_number - 1].rstrip()
+                     if 0 < segment.line_number <= len(lines) else "")
+        if not line_text:
+            line_text = " ".join(s.text.strip() for s in same_section
+                                 if s.line_number == segment.line_number)
+        piece = segment.text.strip()
+        start = -1
+        if piece and not holding:
+            start = line_text.find(piece, max(0, getattr(chord, "column", 0) - len(piece)))
+            if start < 0:
+                start = line_text.find(piece)
+        return LyricView(state="cantando", line_number=segment.line_number, line_text=line_text,
+                         segment="" if holding else piece, segment_start=start,
+                         next_line=self._next_lyric_line(segments, segment.line_number))
+
+    def _next_lyric_line(self, segments, after_line: int) -> str:
+        following = sorted({s.line_number for s in segments if s.line_number > after_line})
+        if not following:
+            return ""
+        line_number = following[0]
+        lines = (self._chart.raw_text or "").split("\n")
+        if 0 < line_number <= len(lines) and lines[line_number - 1].strip():
+            return lines[line_number - 1].strip()
+        return " ".join(s.text.strip() for s in segments if s.line_number == line_number)
+
+    # O seguidor probabilístico só move a cifra com certeza alta e repetida.
+    _FOLLOWER_MIN_PROBABILITY = 0.6
+    _FOLLOWER_CONFIRMATIONS = 2
+
+    def _harmonic_follower(self) -> OnlineChartFollower:
+        capo = self._chart.capo_semitones or self._position_estimator.capo_semitones
+        key = (id(self._alignment), capo)
+        if self._chart_follower is None or self._chart_follower_key != key:
+            self._chart_follower = OnlineChartFollower(self._alignment.event_chords(), capo)
+            self._chart_follower_key = key
+            self._follower_cursor = -1
+        return self._chart_follower
+
+    def _follow_chart_by_harmony(self, timestamp: float, source_context: MusicalContext) -> None:
+        """Adianta a cifra quando a harmonia acumulada mostra a banda à frente do cursor."""
+        if not self._alignment.event_count:
+            return
+        follower = self._harmonic_follower()
+        cursor = self._position_estimator.chart_cursor_index
+        if not follower.active or cursor < self._follower_cursor:
+            # Começo da música, repetição de seção ou navegação manual: recomeça no cursor.
+            follower.reset(cursor)
+        self._follower_cursor = cursor
+        result = follower.observe(timestamp, source_context.raw_chroma_vector)
+        if result is None:
+            return
+        best, probability = result
+        # Só para frente: o seguidor alcança a banda, nunca faz a cifra voltar.
+        if best <= cursor or probability < self._FOLLOWER_MIN_PROBABILITY:
+            self._follower_candidate = (-1, 0)
+            return
+        seen = self._follower_candidate[1] + 1 if self._follower_candidate[0] == best else 1
+        self._follower_candidate = (best, seen)
+        if seen < self._FOLLOWER_CONFIRMATIONS:
+            return
+        self._position_estimator.relocate_to_event(
+            best, "harmonic follower", f"probabilidade={probability:.2f}")
+        self._follower_cursor = best
+        self._follower_candidate = (-1, 0)
+        self._position_generation += 1
+        self._current_chart_pos = self._position_estimator.refresh_position()
+
+    def _after_external_relocation(self) -> None:
+        """Publica na hora a posição corrigida (não espera o próximo tick de áudio)."""
+        self._position_generation += 1
+        self._current_chart_pos = self._position_estimator.refresh_position()
+        self._last_confident_chart_pos = self._current_chart_pos
+        self._publish_position(update_structure=False)
+
+    def apply_lyrics_evidence(self, evidence, now: float) -> str:
+        """A letra cantada diz em que linha da cifra estamos: confirma ou corrige.
+
+        Regras (as mesmas dos acordes): só depois que a música começou; corrige
+        PARA FRENTE (a banda está adiante do cursor); para trás, só se a linha é
+        o início de uma seção (repetição de refrão, por exemplo). Linhas iguais em
+        vários lugares (refrões) escolhem a ocorrência mais próxima à frente.
+        """
+        if not self._music_started or evidence is None:
+            return "ignorada"
+        bpb = max(1, self._clock.beats_per_bar)
+        elapsed_bars = max(0.0, (self._clock.beats_at(now) - self._clock.beats_at(evidence.time)) / bpb)
+        written_bars = [evidence.bar] + [bar for bar, _ in evidence.alternatives]
+        candidates = sorted({b for w in written_bars for b in self._alignment.bars_for_chart_bar(w)})
+        if not candidates:
+            return "sem compasso"
+        current = self.current_bar
+        # Onde a palavra cantada põe a banda AGORA (compasso da palavra + tempo decorrido).
+        projected = [(b, b + int(elapsed_bars)) for b in candidates]
+        line = evidence.line
+        text = f"“{line.text}” ({line.section_name})"
+        ahead = [p for _, p in projected if p >= current]
+        if ahead:
+            target = min(ahead)
+            if target - current <= 1:
+                # Cantores antecipam a palavra antes do tempo 1: até 1 compasso à
+                # frente é confirmação (avançar aqui faria o baixo trocar cedo).
+                self._lyrics_status = f"Letra confirma: {text}"
+                return "confirmada"
+            # Salto longo (a banda pulou partes que a cifra lista): só com a 1ª linha de
+            # OUTRA parte, reconhecida com segurança — trechos com os mesmos acordes
+            # (ponte x refrão) só a letra consegue distinguir.
+            long_jump_ok = (line.first_in_section and evidence.confidence >= 0.75 and
+                            max(evidence.weight, 0.6 * evidence.matched) >= 1.9 and
+                            line.section_name != self.current_section)
+            if target - current <= 16 or long_jump_ok:
+                target = max(current, self._harmonic_refinement(target))
+                if target - current <= 1:
+                    self._lyrics_status = f"Letra confirma: {text}"
+                    return "confirmada"
+                self._position_estimator.relocate_to_bar(target, "lyrics", f"letra: {line.text}")
+                self._after_external_relocation()
+                self._lyrics_status = f"Letra corrigiu → Comp. {target}: {text}"
+                return "corrigida"
+        behind = [p for _, p in projected if p < current]
+        if (behind and line.first_in_section and evidence.confidence >= 0.75 and
+                max(evidence.weight, 0.6 * evidence.matched) >= 1.9 and max(behind) < current - 1):
+            # Primeira linha de uma seção que já passou: a banda REPETIU a seção.
+            target = self._harmonic_refinement(max(behind))
+            self._position_estimator.relocate_to_bar(
+                target, "lyrics section repeat", f"letra: {line.text}")
+            self._after_external_relocation()
+            self._lyrics_status = f"Letra: repetição de seção → Comp. {target}: {text}"
+            return "repetição"
+        if behind and max(behind) == current - 1:
+            # Um compasso atrás é o atraso do reconhecimento: confirma.
+            self._lyrics_status = f"Letra confirma: {text}"
+            return "confirmada"
+        self._lyrics_status = f"Letra ignorada (voltaria na cifra): {text}"
+        return "ignorada"
 
     def _has_musical_activity(self, source_context: Optional[MusicalContext],
                                chord: str, chord_confidence: float,
@@ -693,11 +1009,16 @@ class SongSession:
             ctx.inversion = "slash" if symbol.bass_note and symbol.bass_note != symbol.root else "root"
         ctx.current_section = state.current_section
         ctx.section_progress = position.section_progress
+        ctx.current_section_type = position.section_type or "UNKNOWN"
+        ctx.section_occurrence = position.section_occurrence
+        ctx.bars_until_section_change = position.bars_until_section_change
         ctx.structure_confidence = position.confidence
         ctx.predicted_next_section = state.next_section
-        chart_key = self._chart_key()
+        chart_key = self._region_key(position.event_index)
+        self._publish_key_changes(ctx, position)
         if (self._key_source() == "CHART" and self._alignment.event_count and
                 chart_key not in ("", "--")):
+            # Tom explícito da cifra é AUTORITATIVO no modo cifra (inclui modulações).
             ctx.key = chart_key
             ctx.key_confidence = 1.0
             ctx.previous_key = "--"
@@ -716,6 +1037,56 @@ class SongSession:
         self._update_follow_confidence(ctx, state, timestamp)
         ctx.sync_aliases()
         return state
+
+    def _region_key(self, event_index: int) -> str:
+        """Tom da cifra no evento (tom inicial ou de uma modulação), com o tom escolhido
+        pelo usuário (override) aplicado como deslocamento de toda a música."""
+        base = self._chart_key()
+        if not self._chart.key_changes or not self._alignment.event_count:
+            return base
+        region = self._alignment.key_at_event(event_index)
+        override = self._song.performance_settings.key_override
+        if override and override != self._chart.key:
+            from app.music.key_timeline import transpose_key
+            from app.music.transposition import semitones_between_keys, key_uses_flats
+            shift = semitones_between_keys(self._chart.key, override)
+            return transpose_key(region, shift, key_uses_flats(override))
+        return region
+
+    def region_key_for_event(self, event_index: int) -> str:
+        return self._region_key(event_index)
+
+    @property
+    def current_chart_key(self) -> str:
+        """Tom vigente da cifra no ponto atual (considera as modulações)."""
+        return self._region_key(self._current_chart_pos.event_index)
+
+    def _publish_key_changes(self, ctx: MusicalContext, position: ChartPosition) -> None:
+        """Próxima modulação da cifra: o baixista precisa saber ANTES que ela chegue."""
+        ctx.next_expected_key = "--"
+        ctx.beats_until_key_change = -1.0
+        ctx.bars_until_key_change = -1
+        ctx.key_change_pending = False
+        ctx.key_change_chord = "--"
+        ctx.key_region_index = 0
+        ctx.key_change_confidence = 0.0
+        if not self._chart.key_changes or not self._alignment.event_count:
+            return
+        event = max(0, position.event_index)
+        keys = self._alignment.event_keys()
+        ctx.key_region_index = sum(1 for i in range(1, event + 1) if keys[i] != keys[i - 1])
+        upcoming = self._alignment.next_key_change(event)
+        if upcoming is None:
+            return
+        target_event, _ = upcoming
+        bpb = max(1, self._clock.beats_per_bar)
+        bars = max(0, self._alignment.event_bar(target_event) - position.current_bar)
+        ctx.next_expected_key = self._region_key(target_event)
+        ctx.bars_until_key_change = bars
+        ctx.beats_until_key_change = max(0.0, bars * bpb - (position.current_beat - 1.0))
+        ctx.key_change_pending = True
+        ctx.key_change_chord = self._alignment.event_chords()[target_event]
+        ctx.key_change_confidence = 1.0
 
     def _update_follow_confidence(self, ctx: MusicalContext, state: FusedMusicalState,
                                   timestamp: float) -> None:

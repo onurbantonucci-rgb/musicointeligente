@@ -19,6 +19,10 @@ from app.input.chart_parser import ChartParser
 
 DEFAULT_PROJECT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "virtual_band_project.json"))
 
+# Marca as músicas cujas passagens só de acordes já viraram blocos próprios — a separação
+# roda uma única vez por música, para não desfazer uma junção feita depois pelo usuário.
+INSTRUMENTAL_SPLIT_FLAG = "chord_only_passages_split"
+
 
 class ProjectManager:
     """Gerenciador global da aplicação para projetos, setlists e sessões musicais."""
@@ -147,8 +151,11 @@ class ProjectManager:
         auto_add_to_setlist: bool = True
     ) -> Song:
         """Importa uma música aceitando dados parciais (só áudio, só cifra, ou ambos)."""
+        from app.music.sectionizer import split_chord_only_passages
+
         chart_data = None
         if chart_text.strip():
+            chart_text = split_chord_only_passages(chart_text)
             parsed_chart = ChartParser.parse(
                 text=chart_text,
                 default_key=key,
@@ -177,6 +184,8 @@ class ProjectManager:
                 for s in chart_data.get("sections", []) for l in s.get("lyrics", [])
             )
         )
+
+        new_song.metadata[INSTRUMENTAL_SPLIT_FLAG] = True
 
         if auto_add_to_setlist:
             self._project.get_active_setlist().add_song(new_song)
@@ -289,6 +298,19 @@ class ProjectManager:
             else:
                 return None
 
+        self._apply_chart_text(song, new_chart_text)
+
+        if self._active_session and self._active_session.song.id == song.id:
+            self._active_session.update_chart_text(new_chart_text)
+
+        if self._project.settings.auto_save:
+            self.save_project()
+
+        return song
+
+    @staticmethod
+    def _apply_chart_text(song: Song, new_chart_text: str) -> None:
+        """Grava o texto na música e recalcula cifra, letra, tom, BPM e compasso."""
         parsed_chart = ChartParser.parse(
             text=new_chart_text,
             default_key=song.key,
@@ -313,13 +335,20 @@ class ProjectManager:
 
         song.update_timestamp()
 
-        if self._active_session and self._active_session.song.id == song.id:
-            self._active_session.update_chart_text(new_chart_text)
+    def _split_chord_only_passages_once(self) -> None:
+        """Músicas importadas antes da separação ganham os blocos [Reintro]/[Instrumental]."""
+        from app.music.sectionizer import split_chord_only_passages
 
-        if self._project.settings.auto_save:
-            self.save_project()
-
-        return song
+        for setlist in self._project.setlists:
+            for song in setlist.songs:
+                if song.metadata.get(INSTRUMENTAL_SPLIT_FLAG):
+                    continue
+                song.metadata[INSTRUMENTAL_SPLIT_FLAG] = True
+                if not (song.chart_text or "").strip():
+                    continue
+                new_text = split_chord_only_passages(song.chart_text)
+                if new_text != song.chart_text:
+                    self._apply_chart_text(song, new_text)
 
     # ============================================================
     # Persistência Atômica Local (JSON)
@@ -363,6 +392,7 @@ class ProjectManager:
 
         self._project = Project.from_dict(data)
         self._project_file_path = abs_path
+        self._split_chord_only_passages_once()
         self._sync_setlist_manager()
 
         # Se houver música ativa, inicializa a sessão

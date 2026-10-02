@@ -7,7 +7,7 @@ diretamente, sem precisar analisar o sinal de áudio bruto.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -101,6 +101,16 @@ class MusicalContext:
     candidate_confidence: float = 0.0           # Confiança da candidata (0.0 a 1.0)
     candidate_duration: float = 0.0             # Tempo contínuo em que a candidata lidera (segundos)
     local_tonal_center: str = "--"              # Centro tonal local (raiz harmônica imediata)
+    # Modulações declaradas na cifra ("Tom: A" no meio da música).
+    next_expected_key: str = "--"               # Próximo tom da cifra ("--" se não há modulação à frente)
+    beats_until_key_change: float = -1.0        # Tempos até a modulação (-1 = nenhuma à frente)
+    bars_until_key_change: int = -1             # Compassos até a modulação (-1 = nenhuma à frente)
+    key_change_pending: bool = False            # Há modulação à frente na cifra
+    key_change_chord: str = "--"                # Primeiro acorde do novo tom
+    key_region_index: int = 0                   # 0 = tom inicial, 1 = após a 1ª modulação...
+    key_change_confidence: float = 0.0          # 1.0 quando vem da cifra do usuário
+    # Groove ouvido no áudio (GrooveFeelAnalyzer): perfil suavizado da levada.
+    groove_profile: Optional[Any] = None
 
 
     # ============================================================
@@ -149,6 +159,9 @@ class MusicalContext:
     current_section: str = "UNKNOWN"            # Seção ativa estimada (ex: "VERSE", "CHORUS")
     current_pattern: str = "--"                 # ID do padrão ativo (ex: "P01")
     section_progress: float = 0.0               # Progresso relativo na seção ativa [0.0 a 1.0]
+    current_section_type: str = "UNKNOWN"       # Tipo da seção da cifra (VERSE, CHORUS...)
+    section_occurrence: int = 1                 # 1º refrão, 2º refrão...
+    bars_until_section_change: int = 0          # Compassos (da cifra) até a próxima seção
     structure_confidence: float = 0.0           # Confiança da inferência estrutural
     predicted_next_section: str = "UNKNOWN"     # Próxima seção prevista por repetição
     predicted_next_chords: List[str] = field(default_factory=list) # Próximos acordes (Look-ahead)
@@ -275,6 +288,14 @@ class MusicalContext:
         self.candidate_confidence = 0.0
         self.candidate_duration = 0.0
         self.local_tonal_center = "--"
+        self.next_expected_key = "--"
+        self.beats_until_key_change = -1.0
+        self.bars_until_key_change = -1
+        self.key_change_pending = False
+        self.key_change_chord = "--"
+        self.key_region_index = 0
+        self.key_change_confidence = 0.0
+        self.groove_profile = None
 
         self.bpm = 0.0
         self.beat = 1
@@ -310,6 +331,9 @@ class MusicalContext:
         self.current_section = "UNKNOWN"
         self.current_pattern = "--"
         self.section_progress = 0.0
+        self.current_section_type = "UNKNOWN"
+        self.section_occurrence = 1
+        self.bars_until_section_change = 0
         self.structure_confidence = 0.0
         self.predicted_next_section = "UNKNOWN"
         self.predicted_next_chords.clear()

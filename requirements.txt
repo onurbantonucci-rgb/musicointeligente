@@ -15,5 +15,12 @@ python-docx>=1.1.0    # Importação de cifras em .docx
 pypdf>=4.0.0          # Extração de texto de PDFs digitais
 pytesseract>=0.3.10   # OCR de cifras escaneadas (requer Tesseract instalado no sistema)
 
+# --- Seguir a letra cantada ao vivo (opcional) ---
+# Reconhecimento de fala local, sem internet. Modelo pt-BR (31 MB) em
+# %LOCALAPPDATA%\MusicoInteligente\models\vosk-model-small-pt-0.3
+# (https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip).
+# Sem o pacote ou o modelo, o app funciona normalmente sem esse recurso.
+vosk>=0.3.45
+
 # --- Apenas para a suíte de testes ---
 reportlab>=4.0.0      # Geração de PDFs de teste

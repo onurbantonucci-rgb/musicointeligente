@@ -11,6 +11,7 @@ from tkinter import ttk
 from typing import Callable, Optional
 
 from app.instruments import BassPatternType, BassNoteValue, BassHarmonySource
+from app.instruments.bass_styles import CREATIVITY_LABELS, style_by_label, style_labels
 from app.music.theory import midi_to_hz
 
 
@@ -18,6 +19,7 @@ class BassPlayerPanel(tk.Frame):
     """Aba "🎸 Baixista Virtual" — widgets, handlers e atualização por ciclo."""
 
     PATTERNS = [
+        "ESTILO MUSICAL",
         "FUNDAMENTAIS",
         "AUTO",
         "ROOT + FIFTH",
@@ -26,6 +28,7 @@ class BassPlayerPanel(tk.Frame):
     ]
 
     PATTERN_MAP = {
+        "ESTILO MUSICAL": BassPatternType.STYLE,
         "FUNDAMENTAIS": BassPatternType.FUNDAMENTALS,
         "AUTO": BassPatternType.AUTO,
         "ROOT": BassPatternType.ROOT,
@@ -165,6 +168,44 @@ class BassPlayerPanel(tk.Frame):
         tk.Label(rhythm_bar, text="O BPM e a batida do músico definem os instantes.",
                  bg="#181d26", fg="#8c9ba5", font=("Segoe UI", 8)).pack(side="left")
 
+        # Modo ESTILO MUSICAL: estilo, criatividade e nova variação do arranjo.
+        style_bar = tk.Frame(self, bg="#181d26")
+        style_bar.pack(fill="x", pady=(0, 5))
+        tk.Label(style_bar, text="Estilo:", bg="#181d26", fg="#8c9ba5",
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 6))
+        self.combo_bass_style = ttk.Combobox(
+            style_bar, values=style_labels(), state="readonly", width=20, font=("Segoe UI", 8))
+        self.combo_bass_style.set(style_labels()[0])
+        self.combo_bass_style.pack(side="left", padx=(0, 12))
+        self.combo_bass_style.bind("<<ComboboxSelected>>", self._on_style_changed)
+        tk.Label(style_bar, text="Criatividade:", bg="#181d26", fg="#8c9ba5",
+                 font=("Segoe UI", 8, "bold")).pack(side="left", padx=(0, 4))
+        self.creativity_var = tk.IntVar(value=self._analyzer.bass_player.creativity)
+        self.scale_creativity = ttk.Scale(
+            style_bar, from_=1, to=5, orient="horizontal", length=110)
+        self.scale_creativity.set(self.creativity_var.get())
+        self.scale_creativity.config(command=self._on_creativity_dragged)
+        self.scale_creativity.pack(side="left", padx=(0, 4))
+        self.scale_creativity.bind("<ButtonRelease-1>", self._on_creativity_released)
+        self.lbl_creativity = tk.Label(
+            style_bar, text=self._creativity_text(self.creativity_var.get()), bg="#181d26",
+            fg="#00d2ff", font=("Segoe UI", 8, "bold"), width=14, anchor="w")
+        self.lbl_creativity.pack(side="left", padx=(0, 10))
+        self.btn_new_variation = tk.Button(
+            style_bar, text="🎲 Nova variação", bg="#212836", fg="#f0f4f8",
+            activebackground="#2c3649", activeforeground="#ffffff", font=("Segoe UI", 8),
+            relief="flat", padx=8, pady=2, cursor="hand2", command=self._on_new_variation)
+        self.btn_new_variation.pack(side="left")
+        self._sync_style_controls()
+
+        # Letra cantada como segunda referência de posição na cifra (ao vivo).
+        self.lyrics_var = tk.BooleanVar(value=self._analyzer.lyrics_following)
+        tk.Checkbutton(
+            style_bar, text="🎤 Seguir a letra", variable=self.lyrics_var,
+            command=self._on_lyrics_toggled, bg="#181d26", fg="#f0f4f8",
+            selectcolor="#212836", activebackground="#181d26", activeforeground="#ffffff",
+            font=("Segoe UI", 8)).pack(side="left", padx=(14, 0))
+
         # -------------------------------------------------------------
         # 2. Quatro Cartões de Métricas do Baixista
         # -------------------------------------------------------------
@@ -191,6 +232,9 @@ class BassPlayerPanel(tk.Frame):
                                                bg="#141820", fg="#8c9ba5",
                                                font=("Segoe UI", 7))
         self.lbl_bass_chart_source.pack()
+        self.lbl_bass_lyrics = tk.Label(c2, text="Letra: aguardando voz", bg="#141820", fg="#8c9ba5",
+                                        font=("Segoe UI", 7), wraplength=260, justify="left")
+        self.lbl_bass_lyrics.pack()
 
         c3 = tk.Frame(cards_frame, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
         c3.grid(row=0, column=2, sticky="nsew", padx=2)
@@ -207,6 +251,17 @@ class BassPlayerPanel(tk.Frame):
         self.lbl_bass_next_note.pack(pady=2)
         self.lbl_bass_next_timing = tk.Label(c4, text="Aguardando harmonia", bg="#141820", fg="#8c9ba5", font=("Segoe UI", 7))
         self.lbl_bass_next_timing.pack()
+
+        # -------------------------------------------------------------
+        # 2.5. Cérebro do baixo: seção, tom, groove, energia, decisão e motivos
+        # -------------------------------------------------------------
+        brain = tk.Frame(self, bg="#141820", bd=1, relief="solid", padx=8, pady=4)
+        brain.pack(fill="x", pady=(4, 0))
+        tk.Label(brain, text="🧠 CÉREBRO DO BAIXO (decisão por compasso)", bg="#141820", fg="#c792ea",
+                 font=("Segoe UI", 7, "bold")).pack(anchor="w")
+        self.lbl_bass_brain = tk.Label(brain, text="BASS BRAIN\naguardando a música", bg="#141820",
+                                       fg="#cfd8dc", font=("Consolas", 8), justify="left", anchor="w")
+        self.lbl_bass_brain.pack(fill="x")
 
         # -------------------------------------------------------------
         # 3. Painel de Debug (Tabela de Decisões do Baixista)
@@ -269,7 +324,47 @@ class BassPlayerPanel(tk.Frame):
         val = self.combo_bass_pattern.get()
         p = self.PATTERN_MAP.get(val, BassPatternType.AUTO)
         self._analyzer.bass_player.pattern = p
+        self._sync_style_controls()
         self._set_status(f"Padrão rítmico do baixo alterado para: {val}")
+
+    @staticmethod
+    def _creativity_text(level: int) -> str:
+        return f"{level} · {CREATIVITY_LABELS.get(level, '')}"
+
+    def _sync_style_controls(self) -> None:
+        """Estilo/criatividade só valem no modo ESTILO; a subdivisão, fora dele."""
+        style_mode = self._analyzer.bass_player.pattern == BassPatternType.STYLE
+        state = "readonly" if style_mode else "disabled"
+        self.combo_bass_style.config(state=state)
+        self.scale_creativity.state(["!disabled"] if style_mode else ["disabled"])
+        self.btn_new_variation.config(state="normal" if style_mode else "disabled")
+        self.combo_bass_note_value.config(state="disabled" if style_mode else "readonly")
+
+    def _on_style_changed(self, event=None) -> None:
+        style = style_by_label(self.combo_bass_style.get())
+        self._analyzer.bass_player.style_name = style.name
+        self._set_status(f"Estilo do baixo: {style.label}")
+
+    def _on_creativity_dragged(self, value) -> None:
+        level = int(round(float(value)))
+        self.lbl_creativity.config(text=self._creativity_text(level))
+
+    def _on_creativity_released(self, event=None) -> None:
+        level = int(round(float(self.scale_creativity.get())))
+        self.scale_creativity.set(level)
+        if level != self._analyzer.bass_player.creativity:
+            self._analyzer.bass_player.creativity = level
+            self._set_status(f"Criatividade do baixo: {self._creativity_text(level)}")
+
+    def _on_lyrics_toggled(self) -> None:
+        enabled = bool(self.lyrics_var.get())
+        self._analyzer.set_lyrics_following(enabled)
+        self._set_status("Seguindo a letra cantada como referência da cifra." if enabled
+                         else "Seguimento da letra desligado.")
+
+    def _on_new_variation(self) -> None:
+        seed = self._analyzer.bass_player.new_variation()
+        self._set_status(f"Nova variação do arranjo de baixo (#{seed}).")
 
     def _on_note_value_changed(self, event=None) -> None:
         label = self.combo_bass_note_value.get()
@@ -325,7 +420,8 @@ class BassPlayerPanel(tk.Frame):
                     chord_txt,
                     ev.note,
                     f"{ev.midi_note} ({freq:.1f}Hz)",
-                    self._analyzer.bass_player.pattern.value.upper(),
+                    ("ESTILO" if self._analyzer.bass_player.pattern == BassPatternType.STYLE
+                     else self._analyzer.bass_player.pattern.value.upper()),
                     ev.reason
                 ))
 
@@ -348,12 +444,33 @@ class BassPlayerPanel(tk.Frame):
         playing = bass.synthesizer.playing_event
 
         if bass.enabled:
-            pat_name = ("FUNDAMENTAIS" if bass.pattern == BassPatternType.FUNDAMENTALS else
-                        cur_dec.pattern_type.value.upper() if cur_dec else bass.pattern.value.upper())
-            self.lbl_bass_pattern_active.config(text=pat_name, fg="#00d2ff")
-            self.lbl_bass_sub_pattern.config(text=self.combo_bass_note_value.get())
+            if bass.pattern == BassPatternType.STYLE:
+                self.lbl_bass_pattern_active.config(
+                    text=self.combo_bass_style.get().upper(), fg="#00d2ff")
+                self.lbl_bass_sub_pattern.config(text=bass.style_status(ctx.timestamp))
+            else:
+                pat_name = ("FUNDAMENTAIS" if bass.pattern == BassPatternType.FUNDAMENTALS else
+                            cur_dec.pattern_type.value.upper() if cur_dec else bass.pattern.value.upper())
+                self.lbl_bass_pattern_active.config(text=pat_name, fg="#00d2ff")
+                self.lbl_bass_sub_pattern.config(text=self.combo_bass_note_value.get())
             chart_now = getattr(ctx, "chart_published_chord", "--")
-            source_name = "Cifra" if bass.harmony_source == BassHarmonySource.CHART else "Cifra + áudio"
+            session = getattr(self._analyzer, "_active_session", None)
+            if not self._analyzer.lyrics_following:
+                lyrics_text, lyrics_color = "Letra: desligada", "#5a6677"
+            elif session is not None and self._analyzer.lyrics_available:
+                lyrics_text = session.lyrics_status
+                lyrics_color = "#00e676" if "corrigiu" in lyrics_text or "repetição" in lyrics_text else "#8c9ba5"
+            elif self._analyzer.lyrics_loading:
+                lyrics_text, lyrics_color = "Letra: preparando o reconhecimento de voz…", "#8c9ba5"
+            else:
+                lyrics_text, lyrics_color = "Letra: reconhecimento de voz não instalado (ou cifra sem letra)", "#5a6677"
+            self.lbl_bass_lyrics.config(text=lyrics_text, fg=lyrics_color)
+            if hasattr(self, "lbl_bass_brain"):
+                report = bass.brain_report(ctx.timestamp)
+                if report != getattr(self, "_last_brain_report", None):
+                    self._last_brain_report = report
+                    self.lbl_bass_brain.config(text=report)
+            source_name ="Cifra" if bass.harmony_source == BassHarmonySource.CHART else "Cifra + áudio"
             self.lbl_bass_chart_source.config(
                 text=f"Cifra agora: {chart_now}  |  Fonte: {source_name}",
                 fg="#00e676" if bass.harmony_source == BassHarmonySource.CHART else "#8c9ba5")

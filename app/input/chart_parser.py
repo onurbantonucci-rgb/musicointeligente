@@ -16,6 +16,7 @@ from app.music.chord_chart import (
     ChartLineInfo,
     parse_chord,
 )
+from app.music.key_timeline import KeyChangeEvent, key_semitone_delta
 from app.input.chart_semantic_classifier import (
     ChartSemanticClassifier,
     SemanticLineType,
@@ -121,6 +122,15 @@ class ChartParser:
 
         labels = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
 
+        # Mudanças de tom: o primeiro "Tom:" antes do primeiro acorde é o tom inicial;
+        # os seguintes são modulações que entram no PRÓXIMO acorde tocável (ou no
+        # compasso/tempo explícito de "Tom: A @ compasso 17 tempo 3").
+        music_started = False
+        region_key = detected_key
+        written_events = 0
+        pending_key_change: Optional[Tuple[str, int]] = None
+        key_changes: List[KeyChangeEvent] = []
+
         current_has_header = False
 
         def ensure_section(name: str = "Intro", sec_type: str = "INTRO", line_num: int = 1,
@@ -179,9 +189,18 @@ class ChartParser:
 
             # 2. Metadados (Tom, BPM, Compasso, etc.) — NÃO polui a harmonia!
             if classified.line_type == SemanticLineType.METADATA:
-                meta = classified.extracted_metadata
+                meta = dict(classified.extracted_metadata)
                 if "key" in meta:
-                    detected_key = meta["key"]
+                    anchor = meta.pop("key_anchor", None)
+                    if not music_started and anchor is None:
+                        detected_key = region_key = meta["key"]
+                    elif anchor is not None:
+                        key_changes.append(KeyChangeEvent(
+                            id="", source_line_number=line_num, anchor_bar=anchor[0],
+                            anchor_beat=anchor[1], to_key=meta["key"], explicit_anchor=True))
+                        meta.pop("key")
+                    else:
+                        pending_key_change = (meta.pop("key"), line_num)
                 if "bpm" in meta:
                     detected_bpm = meta["bpm"]
                 if "meter" in meta:
@@ -304,16 +323,45 @@ class ChartParser:
                         lyric_line_str = lines[i + 1]
 
                 chord_symbols_list: List[str] = []
+                # No Cifra Club o acorde fica APROXIMADAMENTE sobre a sílaba: os cortes
+                # da letra vão para o início da palavra sob o acorde (não partem palavras).
+                boundaries: List[int] = []
+                if has_next_lyric:
+                    for _, col_pos in chord_tokens:
+                        col = min(col_pos, len(lyric_line_str))
+                        while col > 0 and not lyric_line_str[col - 1].isspace():
+                            col -= 1
+                        boundaries.append(max(col, boundaries[-1]) if boundaries else col)
+                    # O que se canta ANTES do primeiro acorde da linha (anacruse) pertence
+                    # ao fim do compasso anterior — antes era descartado.
+                    leading = lyric_line_str[:boundaries[0]].strip() if boundaries else ""
+                    if leading:
+                        sec.lyrics.append(LyricSegment(
+                            text=leading + " ",
+                            chord_symbol="",
+                            bar_offset=max(1, current_bar - 1),
+                            section_id=sec.id,
+                            line_number=next_line_num
+                        ))
                 for idx, (sym, col_pos) in enumerate(chord_tokens):
-                    chord_obj = parse_chord(sym, key_context=detected_key)
+                    if pending_key_change is not None:
+                        new_key, key_line = pending_key_change
+                        key_changes.append(KeyChangeEvent(
+                            id="", source_line_number=key_line, anchor_bar=current_bar,
+                            anchor_event_index=written_events, to_key=new_key))
+                        region_key = new_key
+                        pending_key_change = None
+                    music_started = True
+                    written_events += 1
+                    chord_obj = parse_chord(sym, key_context=region_key)
                     chord_symbols_list.append(sym)
 
-                    # Trecho de letra alinhado na coluna do acorde
+                    # Trecho de letra cantado sobre este acorde
                     lyric_snippet = ""
                     if has_next_lyric:
-                        start_col = col_pos
-                        end_col = chord_tokens[idx + 1][1] if (idx + 1) < len(chord_tokens) else len(lyric_line_str)
-                        if start_col < len(lyric_line_str):
+                        start_col = boundaries[idx]
+                        end_col = boundaries[idx + 1] if (idx + 1) < len(chord_tokens) else len(lyric_line_str)
+                        if start_col < end_col:
                             lyric_snippet = lyric_line_str[start_col:end_col].strip()
 
                     chart_chord = ChartChord(
@@ -414,6 +462,12 @@ class ChartParser:
 
             i += 1
 
+        if pending_key_change is not None:
+            # "Tom:" depois do último acorde: vale a partir do fim (nada mais soa nele).
+            key_changes.append(KeyChangeEvent(
+                id="", source_line_number=pending_key_change[1], anchor_bar=current_bar,
+                anchor_event_index=written_events, to_key=pending_key_change[0]))
+
         return ChordChart(
             title=title,
             artist=artist,
@@ -423,5 +477,23 @@ class ChartParser:
             sections=sections,
             raw_text=text,
             metadata=song_metadata,
-            line_map=line_map
+            line_map=line_map,
+            key_changes=cls._finalize_key_changes(detected_key, key_changes),
         )
+
+    @staticmethod
+    def _finalize_key_changes(initial_key: str,
+                              events: List[KeyChangeEvent]) -> List[KeyChangeEvent]:
+        """Ordena as modulações e preenche tom de origem, intervalo e identificador."""
+        ordered = sorted(events, key=lambda e: (e.anchor_bar, e.anchor_beat, e.source_line_number))
+        previous = initial_key
+        result: List[KeyChangeEvent] = []
+        for event in ordered:
+            if event.to_key == previous:
+                continue                        # "Tom:" repetindo o tom vigente não é modulação
+            event.from_key = previous
+            event.semitone_delta = key_semitone_delta(previous, event.to_key)
+            event.id = f"key_{len(result) + 1:02d}"
+            result.append(event)
+            previous = event.to_key
+        return result

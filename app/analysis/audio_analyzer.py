@@ -33,6 +33,7 @@ from app.analysis.key_detector import KeyDetector, KeyResult, KrumhanslSchmuckle
 from app.analysis.key_history import KeyHistory
 from app.analysis.tempo_detector import OnsetTempoDetector, TempoResult
 from app.analysis.chart_harmony_aligner import BeatChroma, align_chart_to_beats
+from app.analysis.groove_feel import GrooveFeelAnalyzer, LiveOnsetGrid
 from app.music.musical_context import MusicalContext
 from app.music.chord_chart import parse_chord
 from app.music.musical_clock import MusicalClock
@@ -102,6 +103,19 @@ class AudioAnalyzer:
         self._timeline_job_key: Optional[tuple] = None
         self._timeline_refs: tuple = ()
         self._pending_timeline: Optional[tuple] = None
+        # Fórmula de compasso OUVIDA no arquivo (6 = colcheias em compasso composto,
+        # ex.: 6/8). None = usa a do relógio. Nunca vem do BPM escrito na cifra.
+        self._audio_beats_per_bar: Optional[int] = None
+        # Escuta do GROOVE em tempo real (leve: uma FFT de 2048 por bloco).
+        self._groove_grid = LiveOnsetGrid(4)
+        self._groove = GrooveFeelAnalyzer(4)
+
+        # Letra cantada como segunda referência de posição (reconhecimento local).
+        # OPCIONAL e desligada por padrão: o padrão segue só os acordes da cifra.
+        self._lyrics_enabled = False
+        self._lyrics_follower = None
+        self._lyrics_key: Optional[int] = None
+        self._lyrics_loading_key: Optional[int] = None
 
 
     @property
@@ -292,6 +306,7 @@ class AudioAnalyzer:
         """Aplica apenas o resultado da faixa ativa, sem apagar seu histórico."""
         with self._lock:
             self._tempo_detector = detector
+            self._audio_beats_per_bar = getattr(detector, "beats_per_bar", None)
             bpm = round(detector.bpm, 1) if detector.bpm > 0 else 120.0
             self._context_manager.clock.bpm = bpm
             self._context_manager.context.bpm = bpm
@@ -306,6 +321,8 @@ class AudioAnalyzer:
         """
         with self._lock:
             self._active_session = None
+            if self._lyrics_follower is not None:
+                self._lyrics_follower.reset()
             if keep_track_analysis:
                 self._tempo_detector.reset_live_state()
             else:
@@ -317,6 +334,72 @@ class AudioAnalyzer:
             self._context_manager.reset()
             self._structure_analyzer.reset()
             self._band.reset_all()
+            bpb = self._audio_beats_per_bar or self._context_manager.clock.beats_per_bar
+            self._groove_grid = LiveOnsetGrid(bpb)
+            self._groove = GrooveFeelAnalyzer(bpb)
+
+    # ------------------------------------------------------------ letra
+    @property
+    def lyrics_following(self) -> bool:
+        return self._lyrics_enabled
+
+    def set_lyrics_following(self, enabled: bool) -> None:
+        with self._lock:
+            self._lyrics_enabled = bool(enabled)
+            if not enabled:
+                self._lyrics_key = self._lyrics_loading_key = None
+                if self._lyrics_follower is not None:
+                    self._lyrics_follower.close()
+                self._lyrics_follower = None
+
+    @property
+    def lyrics_loading(self) -> bool:
+        return self._lyrics_loading_key is not None
+
+    @property
+    def lyrics_available(self) -> bool:
+        return self._lyrics_follower is not None and self._lyrics_follower.available
+
+    def _refresh_lyrics_follower(self, session) -> None:
+        if not self._lyrics_enabled or session is None:
+            return
+        key = id(session.alignment)
+        if key in (self._lyrics_key, self._lyrics_loading_key):
+            return
+        self._lyrics_loading_key = key
+        chart = session.chart
+
+        def load() -> None:
+            try:
+                from app.analysis.lyrics_follower import LyricsFollower, LyricsIndex
+                index = LyricsIndex.from_chart(chart)
+                follower = LyricsFollower(index) if index else None
+            except Exception:
+                logger.exception("Falha ao preparar o seguimento da letra")
+                follower = None
+            with self._lock:
+                if self._lyrics_loading_key != key:
+                    if follower is not None:
+                        follower.close()
+                    return
+                if self._lyrics_follower is not None:
+                    self._lyrics_follower.close()
+                self._lyrics_follower = follower if follower is not None and follower.available else None
+                self._lyrics_key = key
+                self._lyrics_loading_key = None
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _follow_lyrics(self, audio_chunk: np.ndarray, sample_rate: int, timestamp: float,
+                       session) -> None:
+        self._refresh_lyrics_follower(session)
+        follower = self._lyrics_follower
+        if follower is None or session is None:
+            return
+        follower.feed(audio_chunk, sample_rate, timestamp)
+        evidence = follower.take_evidence()
+        if evidence is not None:
+            session.apply_lyrics_evidence(evidence, timestamp)
 
     def set_beat_chroma(self, beat_chroma: Optional[BeatChroma]) -> None:
         """Instala a harmonia por batida do arquivo atual (ou None ao trocar de faixa)."""
@@ -349,7 +432,11 @@ class AudioAnalyzer:
         alignment = session.alignment
         beats_per_bar = self._context_manager.clock.beats_per_bar
         capo = session.chart.capo_semitones
-        key = (id(beat_chroma), id(alignment), capo, beats_per_bar)
+        chart_key = session.song.performance_settings.key_override or session.chart.key
+        # Tom de cada acorde da cifra (modulações "Tom: X" no meio da música).
+        event_keys = tuple(session.region_key_for_event(i) for i in range(alignment.event_count))
+        beats_per_bar = self._audio_beats_per_bar or beats_per_bar
+        key = (id(beat_chroma), id(alignment), capo, beats_per_bar, chart_key, event_keys)
         if key == self._timeline_key:
             return None
         pending = self._pending_timeline
@@ -369,14 +456,20 @@ class AudioAnalyzer:
         job = threading.Thread(
             target=self._align_in_background,
             args=(key, beat_chroma, alignment.event_chords(), beats_per_bar, capo,
-                  alignment.section_start_events()),
+                  alignment.section_start_events(), chart_key, alignment.event_section_types(),
+                  event_keys, alignment.event_section_labels()),
             daemon=True)
         job.start()
         return job
 
-    def _align_in_background(self, key, beat_chroma, chords, beats_per_bar, capo, starts) -> None:
+    def _align_in_background(self, key, beat_chroma, chords, beats_per_bar, capo, starts,
+                             chart_key="", section_types=(), event_keys=(),
+                             section_labels=()) -> None:
         try:
-            timeline = align_chart_to_beats(beat_chroma, chords, beats_per_bar, capo, starts)
+            timeline = align_chart_to_beats(beat_chroma, chords, beats_per_bar, capo, starts,
+                                            key=chart_key, section_types=section_types,
+                                            event_keys=event_keys,
+                                            section_labels=section_labels)
         except Exception:
             logger.exception("Falha ao alinhar a cifra ao áudio")
             timeline = None
@@ -414,7 +507,7 @@ class AudioAnalyzer:
             has_chart = bool(session is not None and session.alignment.event_count)
             key_source = (getattr(session.song.performance_settings, "key_source", "CHART").upper()
                           if session is not None else "AUDIO")
-            chart_key = ((session.song.performance_settings.key_override or session.chart.key)
+            chart_key = (session.current_chart_key
                          if has_chart and key_source == "CHART" else None)
             key_hint = chart_key or self._key_hint
             active_state = self._active_note_tracker.update(
@@ -470,6 +563,7 @@ class AudioAnalyzer:
             ctx.expected_chart_chord = (session.expected_chord if has_chart
                                         else self._expected_chord) or "--"
             ctx.chart_prior_enabled = chart_prior_enabled
+            self._listen_groove(audio_chunk, ctx, audio_activity)
 
             # Localiza primeiro; estrutura, predição e instrumentos só recebem a posição final.
             self._active_session = session
@@ -485,12 +579,28 @@ class AudioAnalyzer:
                     ctx, self._context_manager.chord_history,
                     self._context_manager.key_history, self._context_manager.clock)
             self._refresh_harmony_timeline(session)
+            self._follow_lyrics(audio_chunk, sample_rate, timestamp, session)
             if players is not None:
                 players.dispatch_context(ctx)
             else:
                 self._band.dispatch_context(ctx)
 
             return ctx
+
+    @property
+    def groove_profile(self):
+        return self._groove.profile
+
+    def _listen_groove(self, audio_chunk: np.ndarray, ctx: MusicalContext,
+                       audio_activity: float) -> None:
+        """Ataques do bloco na semicolcheia do relógio; a cada compasso fechado, o perfil."""
+        flux = self._groove_grid.flux(audio_chunk)
+        finished = self._groove_grid.observe(max(1, ctx.bar), max(1, ctx.beat),
+                                             ctx.beat_position, flux, audio_activity)
+        if finished is not None:
+            grid, energy = finished
+            self._groove.observe_bar(grid, energy=energy, bpm=ctx.bpm)
+        ctx.groove_profile = self._groove.profile if self._groove.profile.bars_observed else None
 
     def export_structure_report(self, filepath: str) -> None:
         """Exporta o relatório estrutural completo para arquivo JSON."""

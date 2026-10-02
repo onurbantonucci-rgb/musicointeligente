@@ -85,6 +85,10 @@ TABLATURE_LINE_REGEX = re.compile(
 
 # Seções canônicas mapeadas (Português & Inglês)
 SECTION_MAP = {
+    # Volta da introdução no meio da música (vem ANTES de "intro": a busca é por substring
+    # e a reintro é uma passagem instrumental com a banda cheia, não um início calmo)
+    "reintro": "INSTRUMENTAL",
+    "re-intro": "INSTRUMENTAL",
     # Intro
     "intro": "INTRO",
     "introducao": "INTRO",
@@ -255,14 +259,21 @@ class ChartSemanticClassifier:
 
         # 1. Tom / Tonalidade / Key
         # Exemplos: "Tom: G", "Tom: Am", "Tom: A (com forma de G)", "Tonalidade: C#m", "Key: F#m"
-        tom_match = re.search(r'^(?:tom|tonalidade|key)\s*[:=]\s*([A-G][#b]?(?:m|min|maj|M)?)(?:\s|\(|$)', stripped, re.IGNORECASE)
+        tom_match = re.search(r'^(?:tom|tonalidade|key)\s*[:=]\s*([A-G][#b]?(?:m|min|maj|M)?)(?:\s|\(|@|$)', stripped, re.IGNORECASE)
         if tom_match:
-            k_val = tom_match.group(1).strip()
-            if not ("major" in k_val.lower() or "minor" in k_val.lower() or k_val.endswith("m")):
-                k_val = f"{k_val} Major"
-            elif k_val.endswith("m") and not k_val.endswith("Major"):
-                k_val = f"{k_val[:-1]} Minor"
-            meta["key"] = k_val
+            token = tom_match.group(1).strip()
+            root = token[:2] if len(token) >= 2 and token[1] in "#b" else token[:1]
+            suffix = token[len(root):]
+            root = root[0].upper() + root[1:]
+            mode_word = re.match(r'\s*(maior|menor|major|minor)\b',
+                                 stripped[tom_match.end(1):], re.IGNORECASE)
+            minor = suffix in ("m", "min") or (suffix == "" and mode_word is not None and
+                                                mode_word.group(1).lower() in ("menor", "minor"))
+            meta["key"] = f"{root} {'Minor' if minor else 'Major'}"
+            from app.music.key_timeline import parse_key_anchor
+            anchor = parse_key_anchor(stripped)
+            if anchor is not None:
+                meta["key_anchor"] = anchor
 
         # 2. BPM / Tempo / Andamento
         # Exemplos: "165 bpm", "165 BPM", "BPM: 165", "Tempo: 165", "Andamento: 165 bpm", "[Ritmo Padrão] 165 bpm"
@@ -447,8 +458,10 @@ class ChartSemanticClassifier:
             for m in CHORD_REGEX.finditer(line)
             if cls.is_chord_shaped(m.group(1))
         ]
-        # Ignora o marcador de repetição (x2/2x) na contagem de tokens de letra
-        content_tokens = [t for t in tokens if not re.fullmatch(r'(?i)x[2-9]|[2-9]x', t)]
+        # Ignora o marcador de repetição (x2/2x) e parênteses/traços soltos — ex.: a
+        # passagem "( G  D  Em  C )" do Cifra Club — na contagem de tokens de letra.
+        content_tokens = [t for t in tokens
+                          if not re.fullmatch(r'(?i)x[2-9]|[2-9]x|[()\[\]{}\-–—.]+', t)]
 
         # Uma linha é de ACORDES quando todos os seus tokens têm formato harmônico.
         # Nesse caso preservamos TODOS os acordes, mesmo os que coincidem com palavras
@@ -462,7 +475,7 @@ class ChartSemanticClassifier:
             # Linha ambígua (mistura acorde + letra): aplica desambiguação por stopwords
             # para não confundir palavras da letra com acordes.
             chord_tokens = [(tok, pos) for tok, pos in shaped_matches if cls.is_chord_token(tok)]
-            ratio = len(chord_tokens) / len(content_tokens)
+            ratio = len(chord_tokens) / len(content_tokens) if content_tokens else 0.0
             is_chord = bool(chord_tokens) and ratio >= 0.50
 
             # Reforço por ESPAÇAMENTO (padrão de cifra sobre a letra): acordes numa linha

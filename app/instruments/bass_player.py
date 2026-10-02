@@ -24,6 +24,10 @@ from app.instruments.bass_synthesizer import BassSynthesizer
 from app.music.musical_context import MusicalContext
 from app.music.chord_chart import parse_chord
 from app.analysis.chart_harmony_aligner import HarmonyTimeline, MIN_CONFIDENCE
+from app.instruments.bass_arranger import BassArranger, BassArrangement, BarPlan
+from app.instruments.bass_styles import STYLES, DEFAULT_STYLE
+from app.instruments.bass_intent import (BarContext, BassMusicalIntent, BassMusicalIntentEngine,
+                                         format_brain_report)
 from app.input.chart_semantic_classifier import ChartSemanticClassifier
 from app.music.constants import BASS_DEFAULT_VOLUME
 
@@ -49,7 +53,7 @@ class BassPlayer(VirtualInstrument):
         self._pattern_generator = BassPatternGenerator()
         self._performance_engine = BassPerformanceEngine()
         self._synthesizer = BassSynthesizer(sample_rate=sample_rate, volume=volume)
-        self._synthesizer.strict_mono = pattern == BassPatternType.FUNDAMENTALS
+        self._synthesizer.strict_mono = pattern in (BassPatternType.FUNDAMENTALS, BassPatternType.STYLE)
 
         # Estado instantâneo de execução
         self._current_decision: Optional[BassDecision] = None
@@ -63,6 +67,17 @@ class BassPlayer(VirtualInstrument):
         # cifra agenda cada nota na batida real do áudio com o acorde da cifra.
         self._harmony_timeline: Optional[HarmonyTimeline] = None
         self._timeline_chords: Dict[tuple, str] = {}
+        # Modo ESTILO: arranjo criativo da música inteira (BassArranger).
+        self._style_name: str = DEFAULT_STYLE
+        self._creativity: int = 3
+        self._variation_seed: int = 0
+        self._arrangement: Optional[BassArrangement] = None
+        self._arrangement_key: Optional[tuple] = None
+        self._arrangement_id: int = 0
+        # Intenção musical AO VIVO (sem pré-análise): uma decisão por compasso.
+        self._intent_engine = BassMusicalIntentEngine(self._style_name, self._creativity)
+        self._intent_bar: Optional[Tuple[int, int]] = None
+        self._live_intent: Optional[BassMusicalIntent] = None
 
         # Histórico recente para modo debug e UI (ring-buffer)
         self._recent_events: collections.deque = collections.deque(maxlen=30)
@@ -108,7 +123,7 @@ class BassPlayer(VirtualInstrument):
         if p == BassPatternType.FUNDAMENTALS and self._pattern_override != p:
             self._synthesizer.stop_voices()
         self._pattern_override = p
-        self._synthesizer.strict_mono = p == BassPatternType.FUNDAMENTALS
+        self._synthesizer.strict_mono = p in (BassPatternType.FUNDAMENTALS, BassPatternType.STYLE)
         self._synthesizer.cancel_scheduled()
         self._last_triggered_beat = None
 
@@ -133,6 +148,8 @@ class BassPlayer(VirtualInstrument):
         self._last_chart_position_chord = self._published_chart_chord(context)
         timeline = self._active_timeline(chart_only=True)
         if timeline is not None:
+            if self._pattern_override == BassPatternType.STYLE:
+                return self._schedule_from_arrangement(context, timeline)
             return self._schedule_from_timeline(context, timeline)
         return self._schedule_root_grid(context, allow_current=True)
 
@@ -148,6 +165,111 @@ class BassPlayer(VirtualInstrument):
         self._timeline_chords.clear()
         self._synthesizer.cancel_scheduled()
         self._last_triggered_beat = None
+
+    # ------------------------------------------------------------ modo ESTILO
+    @property
+    def style_name(self) -> str:
+        return self._style_name
+
+    @style_name.setter
+    def style_name(self, name: str) -> None:
+        if name not in STYLES:
+            raise ValueError(f"Estilo desconhecido: {name}")
+        self._style_name = name
+        self._intent_engine = BassMusicalIntentEngine(name, self._creativity)
+        self._invalidate_arrangement()
+
+    @property
+    def creativity(self) -> int:
+        return self._creativity
+
+    @creativity.setter
+    def creativity(self, level: int) -> None:
+        self._creativity = max(1, min(5, int(level)))
+        self._intent_engine.creativity = self._creativity
+        self._invalidate_arrangement()
+
+    @property
+    def variation_seed(self) -> int:
+        return self._variation_seed
+
+    def new_variation(self) -> int:
+        """Gera outra versão do arranjo (mesmo estilo e criatividade)."""
+        self._variation_seed += 1
+        self._invalidate_arrangement()
+        return self._variation_seed
+
+    @property
+    def arrangement(self) -> Optional[BassArrangement]:
+        return self._arrangement
+
+    def style_status(self, time: float) -> str:
+        """Resumo do que o arranjo está tocando no instante ``time`` (para a interface)."""
+        arrangement = self._arrangement
+        if arrangement is None:
+            return f"{STYLES[self._style_name].label} · aguardando análise da música"
+        plan: Optional[BarPlan] = arrangement.bar_at(time)
+        if plan is None:
+            return f"{arrangement.style_label} · aguardando a entrada"
+        extra = plan.fill or (f"variação: {plan.variation}" if plan.variation else "")
+        if plan.source:
+            # "Artista\Música.3.mid" -> "Artista – Música"
+            artist, _, song = plan.source.replace("/", "\\").partition("\\")
+            title = song.rsplit(".mid", 1)[0].rsplit(".", 1)[0] if song else ""
+            extra = f"inspirada em {artist} – {title}" if title else extra
+        text = plan.groove
+        return f"{text} · {extra}" if extra else text
+
+    def _invalidate_arrangement(self) -> None:
+        self._arrangement_key = None
+        self._synthesizer.cancel_scheduled()
+
+    def _arrangement_for(self, timeline: HarmonyTimeline) -> BassArrangement:
+        key = (id(timeline), self._style_name, self._creativity, self._variation_seed)
+        if self._arrangement is None or self._arrangement_key != key:
+            self._arrangement = BassArranger(STYLES[self._style_name]).arrange(
+                timeline, self._creativity, self._variation_seed)
+            self._arrangement_key = key
+            self._arrangement_id += 1
+            self._synthesizer.cancel_scheduled()
+        return self._arrangement
+
+    def _schedule_from_arrangement(self, context: MusicalContext,
+                                   timeline: HarmonyTimeline) -> Optional[BassNoteEvent]:
+        """Agenda as próximas notas do arranjo nos instantes exatos do áudio."""
+        arrangement = self._arrangement_for(timeline)
+        now = max(0.0, context.timestamp)
+        earliest = now - 0.001
+        rendered = self._synthesizer.rendered_until_time
+        if rendered is not None and now - 0.001 < rendered <= now + 0.5:
+            earliest = rendered + 0.001
+        first_event: Optional[BassNoteEvent] = None
+        start = arrangement.first_index_at(earliest)
+        end = arrangement.first_index_at(now + self._TIMELINE_HORIZON)
+        for index in range(start, end):
+            note = arrangement.notes[index]
+            key = ("style", self._arrangement_id, index)
+            if self._synthesizer.was_rendered(key) or self._synthesizer.scheduled_note(key) is not None:
+                continue
+            self._synthesizer.schedule_note(
+                key, note.time, note.midi, note.velocity, note.duration,
+                source="style", confidence=timeline.confidence,
+                generation_id=context.position_generation, note=note.note, musical_time=note.time)
+            event = BassNoteEvent(
+                note=note.note, midi_note=note.midi, start_time=round(note.time, 4),
+                duration=round(note.duration, 4), velocity=note.velocity,
+                beat=note.beat_in_bar, bar=note.bar, confidence=timeline.confidence,
+                reason=note.reason)
+            self._recent_events.append(event)
+            self._current_event = event
+            if first_event is None:
+                first_event = event
+        return first_event
+
+    def _fallback_pattern(self) -> BassPatternType:
+        """Sem a música analisada, o modo ESTILO toca como AUTO."""
+        return (BassPatternType.AUTO if self._pattern_override == BassPatternType.STYLE
+                else self._pattern_override)
 
     def _active_timeline(self, chart_only: bool) -> Optional[HarmonyTimeline]:
         timeline = self._harmony_timeline
@@ -261,6 +383,9 @@ class BassPlayer(VirtualInstrument):
         self._last_chart_position_chord = "--"
         self._last_context = None
         self._recent_events.clear()
+        self._intent_engine.reset()
+        self._intent_bar = None
+        self._live_intent = None
 
     def generate_bar_events(self, context: MusicalContext, bar: int, bar_start_time: float) -> List[BassNoteEvent]:
         """Gera antecipadamente todos os eventos do compasso para o acorde do contexto."""
@@ -314,6 +439,8 @@ class BassPlayer(VirtualInstrument):
             # A posição publicada pela sessão (que só confirma trocas depois de
             # ouvi-las) não participa do agendamento.
             self._last_context = context
+            if self._pattern_override == BassPatternType.STYLE:
+                return self._schedule_from_arrangement(context, timeline)
             return self._schedule_from_timeline(context, timeline)
         if chart_only:
             # Sem a pré-análise (entrada ao vivo, cifra que não bate com o áudio),
@@ -374,7 +501,7 @@ class BassPlayer(VirtualInstrument):
             decision_context.bass_note = symbol.bass_note or symbol.root
             decision_context.inversion = "slash" if symbol.bass_note and symbol.bass_note != symbol.root else "root"
         decision = self._decision_engine.decide(
-            decision_context, pattern_override=self._pattern_override)
+            decision_context, pattern_override=self._fallback_pattern())
         self._current_decision = decision
 
         # 2. Padrão rítmico
@@ -503,8 +630,8 @@ class BassPlayer(VirtualInstrument):
         if (not chart_only and follow_level == "LOW" and beat != 1 and
                 source != "audio-confirmed"):
             return None
-        effective_pattern = self._pattern_override
-        if not chart_only and self._pattern_override == BassPatternType.AUTO:
+        effective_pattern = self._fallback_pattern()
+        if not chart_only and effective_pattern == BassPatternType.AUTO:
             if follow_level == "LOW":
                 # Uma variação já confirmada é evidência forte suficiente para
                 # uma fundamental segura no beat atual; ainda não há antecipação.
@@ -512,6 +639,13 @@ class BassPlayer(VirtualInstrument):
                                      else BassPatternType.SUSTAINED)
             elif follow_level == "MEDIUM":
                 effective_pattern = BassPatternType.ROOT_FIFTH
+        intent = None
+        pattern_note_value = BassNoteValue.QUARTER
+        if self._pattern_override in (BassPatternType.AUTO, BassPatternType.STYLE):
+            # A intenção (seção + groove + confiança) decide quanto tocar; a
+            # segurança (confiança baixa) nunca é afrouxada por ela.
+            intent = self._intent_for(context, beats)
+            effective_pattern, pattern_note_value = self._pattern_for_intent(intent, effective_pattern)
         same_key = key == self._last_triggered_beat
         # O callback remove o evento da fila ao renderizar. Uma correção de fase
         # posterior não pode transformar o mesmo beat em um segundo ataque.
@@ -539,7 +673,8 @@ class BassPlayer(VirtualInstrument):
         context.decision_latency = (time.perf_counter() - decision_started) * 1000.0
         self._current_decision = decision
         steps = self._pattern_generator.generate_pattern(decision, beats=beats,
-                                                         chord_duration_beats=float(beats))
+                                                         chord_duration_beats=float(beats),
+                                                         note_value=pattern_note_value)
         step = next((item for item in steps if item[0] == beat), None)
         self._last_triggered_beat = key
         self._last_chord = next_chord
@@ -547,8 +682,15 @@ class BassPlayer(VirtualInstrument):
         if step is None:
             return None
         _, note_name, midi_note, reason = step
-        duration = beat_duration * (beats * 0.95 if decision.pattern_type == BassPatternType.SUSTAINED else 0.85)
-        velocity = 100 if beat == 1 else 92 if beat == 3 else 85
+        sustained = decision.pattern_type == BassPatternType.SUSTAINED
+        if intent is not None:
+            span = beats if sustained else pattern_note_value.beats
+            duration = beat_duration * span * (0.95 if sustained else intent.note_length_factor)
+            velocity = int(min(127, intent.velocity_base + (intent.accent if beat == 1 else 0)))
+            reason = f"{reason} [{intent.density_target}]"
+        else:
+            duration = beat_duration * (beats * 0.95 if sustained else 0.85)
+            velocity = 100 if beat == 1 else 92 if beat == 3 else 85
         event = BassNoteEvent(note=note_name, midi_note=midi_note,
                               start_time=round(start_time, 4), duration=round(duration, 4),
                               velocity=velocity, beat=beat, bar=bar,
@@ -576,6 +718,70 @@ class BassPlayer(VirtualInstrument):
         self._recent_events.append(event)
         self._current_event = event
         return event
+
+    # ------------------------------------------------------------ intenção ao vivo
+    _PATTERN_RISK = {BassPatternType.SUSTAINED: 0, BassPatternType.ROOT: 1,
+                     BassPatternType.ROOT_FIFTH: 2, BassPatternType.AUTO: 2}
+
+    def _intent_for(self, context: MusicalContext, beats: int) -> BassMusicalIntent:
+        """Intenção do compasso atual (recalculada só quando o compasso muda)."""
+        bar_key = (context.position_generation, max(1, context.clock_bar))
+        if self._live_intent is not None and self._intent_bar == bar_key:
+            return self._live_intent
+        chord = self._published_chart_chord(context) if context.chart_available else context.chord
+        duration = (context.expected_chord_duration_beats
+                    if context.expected_chord_duration_beats > 0 else float(beats))
+        position_conf = context.position_confidence if context.chart_available else context.confidence
+        self._live_intent = self._intent_engine.plan_bar(BarContext(
+            bar_number=max(1, context.clock_bar), beats_per_bar=beats,
+            section_key=context.current_section if context.current_section not in ("", "--") else "",
+            section_type=getattr(context, "current_section_type", context.current_section),
+            section_occurrence=getattr(context, "section_occurrence", 1),
+            section_progress=context.section_progress,
+            bars_until_section_change=getattr(context, "bars_until_section_change", 99),
+            chords=[chord] * beats, next_chord=context.next_expected_chord,
+            chord_duration_beats=duration, current_key=context.key,
+            next_key=getattr(context, "next_expected_key", "--"),
+            beats_until_key_change=getattr(context, "beats_until_key_change", -1.0),
+            groove=getattr(context, "groove_profile", None),
+            position_confidence=position_conf,
+            chord_confidence=1.0 if context.chart_available else context.chord_confidence))
+        self._intent_bar = bar_key
+        return self._live_intent
+
+    def _pattern_for_intent(self, intent: BassMusicalIntent,
+                            safety: BassPatternType) -> Tuple[BassPatternType, BassNoteValue]:
+        """Padrão que a intenção pede, nunca mais arriscado que a segurança permite."""
+        if intent.fallback_pattern == "SUSTAINED" or intent.sustain_preferred or intent.attacks_cap <= 1.6:
+            wanted, value = BassPatternType.SUSTAINED, BassNoteValue.WHOLE
+        elif intent.fallback_pattern == "ROOT" or intent.attacks_cap <= 3.2:
+            wanted, value = BassPatternType.ROOT, BassNoteValue.HALF
+        else:
+            wanted, value = BassPatternType.ROOT_FIFTH, BassNoteValue.QUARTER
+        if self._PATTERN_RISK.get(safety, 2) < self._PATTERN_RISK[wanted]:
+            value = BassNoteValue.HALF if safety == BassPatternType.ROOT else BassNoteValue.WHOLE
+            return safety, value
+        return wanted, value
+
+    @property
+    def live_intent(self) -> Optional[BassMusicalIntent]:
+        return self._live_intent
+
+    def brain_report(self, time: float) -> str:
+        """Painel 'BASS BRAIN': o que o baixo está decidindo e por quê (dados objetivos)."""
+        arrangement = self._arrangement
+        if (self._pattern_override == BassPatternType.STYLE and arrangement is not None and
+                self._active_timeline(chart_only=True) is not None):
+            plan = arrangement.bar_at(time)
+            if plan is not None and plan.intent:
+                intent = BassMusicalIntent(**plan.intent)
+                return format_brain_report(intent, plan.phrase or plan.groove,
+                                           plan.decision or plan.groove,
+                                           intent.bars_left_in_phrase)
+        intent = self._live_intent
+        decision = self._current_event.reason if self._current_event is not None else "--"
+        return format_brain_report(intent, intent.groove_label if intent else "--", decision,
+                                   intent.bars_left_in_phrase if intent else 0)
 
     # Janela de agendamento à frente da leitura: cobre alguns callbacks de áudio.
     _TIMELINE_HORIZON = 0.45

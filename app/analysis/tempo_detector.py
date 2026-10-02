@@ -73,14 +73,61 @@ class OnsetTempoDetector(TempoDetector):
         self._beats_per_measure: int = 4
         self._previous_energy: float = 0.0
         self._live_pulse: Optional[float] = None
+        # Compasso ouvido na faixa: 6 = compasso composto (grade em colcheias, ex.: 6/8).
+        # None = compasso simples (quem usa a grade mantém a sua fórmula, ex.: 4/4).
+        self._audio_beats_per_bar: Optional[int] = None
 
     @property
     def bpm(self) -> float:
         return self._bpm
 
     @property
+    def beats_per_bar(self) -> Optional[int]:
+        """Batidas da grade por compasso detectadas no ÁUDIO (6 em 6/8), ou None."""
+        return self._audio_beats_per_bar
+
+    @property
     def beat_times(self) -> np.ndarray:
         return self._beat_times
+
+    # Compasso composto: o pulso escolhido pelo rastreador quase não se repete na
+    # música (autocorrelação baixa), mas o DOBRO dele se repete muito — o pulso real
+    # é o dobro (semínima pontuada) e ele se divide em 3 colcheias.
+    _COMPOUND_PULSE_RATIO = 0.6
+    _COMPOUND_MIN_DOUBLE = 0.4
+
+    @classmethod
+    def _compound_eighth_bpm(cls, envelope: np.ndarray, sample_rate: int,
+                             beat_frames) -> Optional[float]:
+        """BPM das colcheias quando a faixa é em compasso composto (6/8), senão None."""
+        frames = np.asarray(beat_frames)
+        if len(frames) < 8 or len(envelope) < 64:
+            return None
+        period = float(np.median(np.diff(frames)))      # em quadros do envelope (hop 512)
+        if period <= 2:
+            return None
+        signal = np.asarray(envelope, dtype=np.float64)
+        # Suaviza (±2 quadros): pulsos que caem a um quadro de distância contam juntos.
+        signal = np.convolve(signal, np.hanning(5) / np.hanning(5).sum(), mode="same")
+        signal = signal - signal.mean()
+        size = int(round(period * 2)) + 3
+        if size >= len(signal):
+            return None
+        ac = librosa.autocorrelate(signal, max_size=size + 1)
+        if ac[0] <= 0:
+            return None
+        ac = ac / ac[0]
+
+        def at(lag: float) -> float:
+            i = int(round(lag))
+            return float(np.max(ac[max(1, i - 1):i + 2]))
+
+        single, double = at(period), at(2 * period)
+        if double < cls._COMPOUND_MIN_DOUBLE or single >= cls._COMPOUND_PULSE_RATIO * double:
+            return None
+        hop_seconds = 512.0 / sample_rate
+        eighth_seconds = (2.0 * period / 3.0) * hop_seconds
+        return 60.0 / eighth_seconds
 
     def reset_live_state(self) -> None:
         """Zera só o rastreamento ao vivo; a grade pré-analisada da faixa continua."""
@@ -124,8 +171,29 @@ class OnsetTempoDetector(TempoDetector):
                 eff_sr = sample_rate
 
             # Extrair envelope de onset e calcular BPM e frames de batidas
-            tempo, beat_frames = librosa.beat.beat_track(y=decimated_audio, sr=eff_sr)
-            self._beat_times = librosa.frames_to_time(beat_frames, sr=eff_sr).astype(np.float32)
+            envelope = librosa.onset.onset_strength(y=decimated_audio, sr=eff_sr)
+            tempo, beat_frames = librosa.beat.beat_track(onset_envelope=envelope, sr=eff_sr)
+            beat_times = librosa.frames_to_time(beat_frames, sr=eff_sr)
+            self._audio_beats_per_bar = None
+            tight_kwargs = {}
+            eighth_bpm = self._compound_eighth_bpm(envelope, eff_sr, beat_frames)
+            if eighth_bpm is not None:
+                # Compasso composto (6/8, 12/8): a grade passa a ser de colcheias e o
+                # compasso tem 6 delas. Tudo vem do áudio, nunca do BPM escrito na cifra.
+                tempo, beat_frames = librosa.beat.beat_track(
+                    onset_envelope=envelope, sr=eff_sr, start_bpm=eighth_bpm, tightness=400)
+                beat_times = librosa.frames_to_time(beat_frames, sr=eff_sr)
+                tight_kwargs = {"start_bpm": eighth_bpm}
+                self._audio_beats_per_bar = 6
+            # Levadas sincopadas fazem o rastreador "escorregar" meia batida e seguir
+            # nos contratempos. Um rastreamento rígido (não escorrega, mas acompanha mal
+            # variações de andamento) serve de referência de FASE para corrigir só os
+            # trechos escorregados, mantendo a flexibilidade no resto da música.
+            _, tight_frames = librosa.beat.beat_track(onset_envelope=envelope, sr=eff_sr,
+                                                      tightness=1600, **tight_kwargs)
+            beat_times = self._repair_half_beat_slips(
+                beat_times, librosa.frames_to_time(tight_frames, sr=eff_sr))
+            self._beat_times = np.asarray(beat_times, dtype=np.float32)
             # A fase do beat_track tem viés sistemático (~+30 ms com quadros de 23 ms):
             # alinhamos a grade ao ataque real, medido num envelope de alta resolução.
             self._beat_times = self._refine_beat_phase(decimated_audio, eff_sr, self._beat_times)
@@ -175,6 +243,86 @@ class OnsetTempoDetector(TempoDetector):
             return beat_times
         return np.clip(beat_times + shift, 0.0, None).astype(np.float32)
 
+    @staticmethod
+    def _repair_half_beat_slips(beats: np.ndarray, reference: np.ndarray,
+                                min_run: int = 4) -> np.ndarray:
+        """Volta para a fase certa os trechos que ficaram meia batida deslocados.
+
+        Um escorregão aparece como um intervalo brusco de ~0,5 ou ~1,5 período
+        entre batidas vizinhas (variação de andamento é gradual e não gera isso).
+        Os trechos entre escorregões alternam de fase; ``reference`` (uma grade
+        rígida, que não escorrega) decide qual das duas fases é a do tempo.
+        """
+        beats = np.asarray(beats, dtype=np.float64)
+        reference = np.asarray(reference, dtype=np.float64)
+        if len(beats) < 8 or len(reference) < 8:
+            return beats
+        intervals = np.diff(beats)
+        local = np.array([np.median(intervals[max(0, i - 8):i + 9]) for i in range(len(intervals))])
+        deviation = intervals / local - 1.0
+        # O escorregão pode ser brusco (um intervalo de 0,5/1,5 período) ou espalhado
+        # por até 4 intervalos; antes e depois dele o andamento é estável. Variação
+        # real de andamento soma muito pouco em 4 batidas.
+        slips = []
+        transition = set()        # batidas no meio de um escorregão gradual: sem fase definida
+        i = 1
+        while i < len(deviation) - 1:
+            found = False
+            if abs(deviation[i - 1]) < 0.12 and abs(deviation[i]) >= 0.12:
+                for width in range(1, 5):
+                    after = deviation[i + width:i + width + 3]
+                    total = float(deviation[i:i + width].sum())
+                    if 0.35 <= abs(total) <= 0.65 and len(after) and np.all(np.abs(after) < 0.12):
+                        slips.append(i + width - 1)
+                        transition.update(range(i + 1, i + width))
+                        i += width
+                        found = True
+                        break
+            if not found:
+                i += 1
+        slips = np.asarray(slips, dtype=int)
+        if not len(slips):
+            return beats
+        parity = np.zeros(len(beats), dtype=int)
+        for s in slips:
+            parity[s + 1:] ^= 1
+
+        def phase_error(times: np.ndarray) -> np.ndarray:
+            idx = np.clip(np.searchsorted(reference, times), 1, len(reference) - 1)
+            nearest = np.where(np.abs(reference[idx - 1] - times) < np.abs(reference[idx] - times),
+                               reference[idx - 1], reference[idx])
+            period = float(np.median(np.diff(reference)))
+            return (times - nearest) / period
+
+        errors = phase_error(beats)
+        mean_abs = [float(np.mean(np.abs(errors[parity == p]))) if np.any(parity == p) else 1.0
+                    for p in (0, 1)]
+        wrong = int(np.argmax(mean_abs))
+        if abs(mean_abs[0] - mean_abs[1]) < 0.15:
+            return beats                       # sem evidência clara de qual fase é a certa
+        repaired = beats.copy()
+        segment_starts = [0] + [int(s) + 1 for s in slips]
+        segment_ends = [int(s) + 1 for s in slips] + [len(beats)]
+        for a, b in zip(segment_starts, segment_ends):
+            if parity[a] != wrong or b - a < min_run:
+                continue
+            direction = np.sign(np.median(errors[a:b])) or 1.0
+            repaired[a:b] -= direction * 0.5 * local[min(a, len(local) - 1)]
+        # Nas emendas surgem batidas duplicadas (meio período de distância) ou
+        # lacunas (um período e meio): remove as primeiras, preenche as segundas.
+        repaired = np.delete(repaired, sorted(transition))
+        repaired.sort()
+        typical = float(np.median(intervals))
+        cleaned = [repaired[0]]
+        for b in repaired[1:]:
+            gap = b - cleaned[-1]
+            if gap < 0.6 * typical:
+                continue
+            missing = int(round(gap / typical)) - 1
+            for m in range(missing):
+                cleaned.append(cleaned[-1] + gap / (missing + 1))
+            cleaned.append(b)
+        return np.asarray(cleaned)
     @staticmethod
     def _refine_bpm(beat_times: np.ndarray, coarse_bpm: float) -> float:
         """Refina o BPM pela regressão linear das batidas, com fallback no valor bruto.

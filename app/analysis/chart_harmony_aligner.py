@@ -57,6 +57,11 @@ _SKIP_EVENT_COST = 1.50       # pular um acorde da cifra
 _JUMP_SECTION_COST = 2.50     # voltar/avançar para o início de outra seção
 _OUTSIDE_REWARD_SILENT = 0.60  # antes/depois da música, em silêncio
 _OUTSIDE_REWARD_SOUND = 0.30   # antes/depois da música, com som (introdução fora da cifra)
+# Entrada de seção onde a energia da música muda (banda "abre" ou "fecha"): resolve
+# fronteiras ambíguas, como verso terminando no mesmo acorde que abre o refrão.
+_SECTION_NOVELTY_BONUS = 0.40
+# Quanto um acorde precisa se destacar da média das tríades para contar como música.
+_CHORD_CONTRAST = 0.12
 
 MIN_CONFIDENCE = 0.55
 
@@ -86,8 +91,18 @@ class BeatChroma:
     """Harmonia média de cada batida do arquivo (pré-análise, independente da cifra)."""
     beat_times: np.ndarray            # início de cada batida (B+1 valores: o último fecha a última)
     chroma: np.ndarray                # (B, 12), normalizado por linha
-    energy: np.ndarray                # (B,) RMS médio da batida
+    energy: np.ndarray                # (B,) RMS médio da batida, calibrado (~1 = trecho forte típico)
     duration: float
+    # (B, 4) força dos ataques em cada semicolcheia da batida (levada do músico),
+    # normalizada pela música inteira (~1 = ataque forte típico).
+    onsets: Optional[np.ndarray] = None
+    # (B, 12) harmonia da metade final da batida: revela antecipações (a banda
+    # já tocando o próximo acorde no contratempo).
+    tail_chroma: Optional[np.ndarray] = None
+    # (B, 4) ataques só na região GRAVE (< 200 Hz: bumbo, baixo) e AGUDA (> 3 kHz:
+    # chimbal, caixa, palhetada) — alimentam a escuta de groove.
+    low_onsets: Optional[np.ndarray] = None
+    high_onsets: Optional[np.ndarray] = None
 
     @property
     def beat_count(self) -> int:
@@ -149,6 +164,8 @@ def compute_beat_chroma(mono_audio: np.ndarray, sample_rate: int,
     except Exception:
         chroma = librosa.feature.chroma_stft(y=audio, sr=_ANALYSIS_SR, hop_length=_HOP, n_fft=4096)
     rms = librosa.feature.rms(y=audio, hop_length=_HOP)[0]
+    onset_env = librosa.onset.onset_strength(y=audio, sr=_ANALYSIS_SR, hop_length=_HOP)
+    band_envs = _band_onset_envelopes(librosa, audio, len(onset_env))
     frames = min(chroma.shape[1], len(rms))
     chroma, rms = chroma[:, :frames], rms[:frames]
     frame_times = librosa.frames_to_time(np.arange(frames), sr=_ANALYSIS_SR, hop_length=_HOP)
@@ -159,6 +176,10 @@ def compute_beat_chroma(mono_audio: np.ndarray, sample_rate: int,
     count = len(grid) - 1
     beat_chroma = np.zeros((count, 12), dtype=np.float64)
     energy = np.zeros(count, dtype=np.float64)
+    onsets = np.zeros((count, 4), dtype=np.float64)
+    band_onsets = [np.zeros((count, 4), dtype=np.float64) for _ in band_envs]
+    tail_chroma = np.zeros((count, 12), dtype=np.float64)
+    onset_times = librosa.frames_to_time(np.arange(len(onset_env)), sr=_ANALYSIS_SR, hop_length=_HOP)
     for k in range(count):
         start, end = grid[k], grid[k + 1]
         period = end - start
@@ -173,7 +194,48 @@ def compute_beat_chroma(mono_audio: np.ndarray, sample_rate: int,
         if norm > 0:
             beat_chroma[k] = vector / norm
         energy[k] = float(rms[lo:hi].mean())
-    return BeatChroma(beat_times=grid, chroma=beat_chroma, energy=energy, duration=duration)
+        a, b = np.searchsorted(frame_times, (start + 0.55 * period, end))
+        if b > a:
+            tail = chroma[:, a:b].mean(axis=1)
+            tail_norm = float(np.linalg.norm(tail))
+            if tail_norm > 0:
+                tail_chroma[k] = tail / tail_norm
+        for slot in range(4):
+            center = start + period * slot / 4.0
+            a, b = np.searchsorted(onset_times, (center - period / 16.0, center + period / 8.0))
+            if b > a:
+                onsets[k, slot] = float(onset_env[a:b].max())
+                for env, target in zip(band_envs, band_onsets):
+                    target[k, slot] = float(env[a:min(b, len(env))].max()) if a < len(env) else 0.0
+    for values in [onsets] + band_onsets:
+        reference = float(np.percentile(values[values > 0], 95)) if np.any(values > 0) else 1.0
+        values /= max(1e-9, reference)
+    # Energia calibrada pela faixa (~1 = trecho forte típico): uma constante de
+    # calibração, como a dos ataques — as decisões continuam só com o passado.
+    loud = float(np.percentile(energy[energy > 0], 90)) if np.any(energy > 0) else 1.0
+    energy /= max(1e-9, loud)
+    return BeatChroma(beat_times=grid, chroma=beat_chroma, energy=energy, duration=duration,
+                      onsets=onsets, tail_chroma=tail_chroma,
+                      low_onsets=band_onsets[0] if band_onsets else None,
+                      high_onsets=band_onsets[1] if len(band_onsets) > 1 else None)
+
+
+def _band_onset_envelopes(librosa, audio: np.ndarray, length: int) -> List[np.ndarray]:
+    """Envelopes de ataque das regiões grave (< 200 Hz) e aguda (> 3 kHz)."""
+    try:
+        mel = librosa.feature.melspectrogram(y=audio, sr=_ANALYSIS_SR, hop_length=_HOP,
+                                             n_mels=64, fmax=_ANALYSIS_SR / 2)
+        freqs = librosa.mel_frequencies(n_mels=64, fmax=_ANALYSIS_SR / 2)
+        db = librosa.power_to_db(mel, ref=np.max)
+        envelopes = []
+        for mask in (freqs < 200.0, freqs > 3000.0):
+            if not np.any(mask):
+                return []
+            env = librosa.onset.onset_strength(S=db[mask], sr=_ANALYSIS_SR, hop_length=_HOP)
+            envelopes.append(np.asarray(env[:length], dtype=np.float64))
+        return envelopes
+    except Exception:
+        return []
 
 
 @dataclass
@@ -196,6 +258,17 @@ class HarmonyTimeline:
     downbeat_phase: int = 0                # batida k é tempo 1 quando (k - fase) % beats_per_bar == 0
     confidence: float = 0.0
     transposition: int = 0
+    # Material para o arranjo do baixo (mesmo índice das batidas).
+    energy: Optional[np.ndarray] = None            # (B,) intensidade da música
+    onsets: Optional[np.ndarray] = None            # (B, 4) acentos da levada por semicolcheia
+    low_onsets: Optional[np.ndarray] = None        # (B, 4) ataques graves (bumbo/baixo)
+    high_onsets: Optional[np.ndarray] = None       # (B, 4) ataques agudos (chimbal/caixa)
+    tail_chroma: Optional[np.ndarray] = None       # (B, 12) harmonia do fim de cada batida
+    key: str = ""                                  # tom soante (já com a transposição)
+    event_sections: List[str] = field(default_factory=list)   # tipo de seção de cada evento
+    event_keys: List[str] = field(default_factory=list)       # tom soante de cada evento (modulações)
+    event_section_labels: List[str] = field(default_factory=list)  # "Refrão#2" por evento
+    section_start_events: List[int] = field(default_factory=list)
 
     @property
     def beat_count(self) -> int:
@@ -212,6 +285,18 @@ class HarmonyTimeline:
 
     def chord_at(self, timestamp: float) -> Optional[str]:
         return self.chord_at_beat(self.beat_index_at(timestamp))
+
+    def key_at_beat(self, index: int) -> str:
+        """Tom soante na batida (considera as modulações da cifra)."""
+        if self.event_keys and 0 <= index < len(self.event_indices):
+            event = self.event_indices[index]
+            if 0 <= event < len(self.event_keys):
+                return self.event_keys[event]
+            # Fora da música: o tom do evento mais próximo já visto.
+            for back in range(index, -1, -1):
+                if 0 <= self.event_indices[back] < len(self.event_keys):
+                    return self.event_keys[self.event_indices[back]]
+        return self.key
 
     def beat_position(self, index: int) -> Tuple[int, int]:
         """(compasso, tempo) da batida ``index`` na grade de compassos da música."""
@@ -253,13 +338,49 @@ def _event_templates(chords: Sequence[str], shift: int) -> Tuple[np.ndarray, Lis
     return templates, symbols
 
 
+def _energy_novelty(energy: np.ndarray, window: int) -> np.ndarray:
+    """0..1: quanto a energia muda ao redor de cada batida (escala log, simétrica)."""
+    count = len(energy)
+    novelty = np.zeros(count)
+    for b in range(1, count):
+        before = energy[max(0, b - window):b]
+        after = energy[b:b + window]
+        if before.size and after.size:
+            ratio = (float(after.mean()) + 1e-6) / (float(before.mean()) + 1e-6)
+            novelty[b] = min(1.0, abs(math.log2(ratio)) / 1.5)
+    return novelty
+
+
+_GENERIC_TRIADS = None
+
+
+def _generic_similarity(chroma: np.ndarray) -> np.ndarray:
+    """Semelhança média de cada batida com as 24 tríades: o "fundo" harmônico.
+
+    Bateria, ruído e chiado têm cromagrama espalhado — parecem um pouco com
+    QUALQUER acorde. Um acorde de verdade se destaca bem acima dessa média.
+    """
+    global _GENERIC_TRIADS
+    if _GENERIC_TRIADS is None:
+        names = [f"{p}{q}" for p in ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+                 for q in ("", "m")]
+        _GENERIC_TRIADS = np.array([chord_template(n) for n in names])
+    return np.clip(chroma @ _GENERIC_TRIADS.T, 0.0, 1.0).mean(axis=1)
+
+
 def _viterbi(similarity: np.ndarray, silent: np.ndarray, phase: int, beats_per_bar: int,
-             section_starts: np.ndarray) -> Tuple[float, np.ndarray]:
+             section_starts: np.ndarray,
+             novelty: Optional[np.ndarray] = None,
+             generic: Optional[np.ndarray] = None) -> Tuple[float, np.ndarray]:
     """Melhor caminho monotônico pela cifra. Estados: 0=antes, 1..J=eventos, J+1=depois."""
     beats, events = similarity.shape
     states = events + 2
     neg = -1e18
     outside = np.where(silent, _OUTSIDE_REWARD_SILENT, _OUTSIDE_REWARD_SOUND)
+    if generic is not None:
+        # Antes/depois da música vence sempre que nenhum acorde se destaca do fundo
+        # harmônico (contagem da bateria, ruído, conversa, afinação).
+        outside = np.maximum(outside, generic + _CHORD_CONTRAST)
     emission = np.empty((beats, states))
     emission[:, 0] = outside
     emission[:, 1:events + 1] = similarity
@@ -280,12 +401,16 @@ def _viterbi(similarity: np.ndarray, silent: np.ndarray, phase: int, beats_per_b
     back[0] = np.arange(states)
     ev = np.arange(1, events + 1)
     starts = section_starts + 1  # índices de estado
+    section_bonus = np.zeros(events)
+    section_bonus[section_starts] = _SECTION_NOVELTY_BONUS
     for b in range(1, beats):
         change = change_cost(b)
         best = score.copy()
         arg = np.arange(states)
         # avança um evento (inclui antes -> primeiro evento)
         cand = score[:-2] - change
+        if novelty is not None:
+            cand = cand + section_bonus * novelty[b]
         take = cand > best[1:-1]
         best[1:-1] = np.where(take, cand, best[1:-1])
         arg[1:-1] = np.where(take, np.arange(0, events), arg[1:-1])
@@ -320,9 +445,27 @@ def _viterbi(similarity: np.ndarray, silent: np.ndarray, phase: int, beats_per_b
     return float(score[final]), path
 
 
+def _transpose_chroma(chroma: Optional[np.ndarray], shift: int) -> Optional[np.ndarray]:
+    if chroma is None:
+        return None
+    return np.roll(np.asarray(chroma, dtype=np.float64), shift, axis=1)
+
+
+def _transpose_key(key: str, shift: int) -> str:
+    shift %= 12
+    if not key or not shift:
+        return key or ""
+    from app.music.transposition import parse_key_root_mode, transpose_note_name
+    root, mode = parse_key_root_mode(key)
+    return f"{transpose_note_name(root, shift)} {'Minor' if mode == 'minor' else 'Major'}"
+
+
 def align_chart_to_beats(beat_chroma: BeatChroma, chart_chords: Sequence[str],
                          beats_per_bar: int = 4, capo_semitones: int = 0,
-                         section_starts: Sequence[int] = ()) -> Optional[HarmonyTimeline]:
+                         section_starts: Sequence[int] = (), key: str = "",
+                         section_types: Sequence[str] = (),
+                         event_keys: Sequence[str] = (),
+                         section_labels: Sequence[str] = ()) -> Optional[HarmonyTimeline]:
     """Encaixa a sequência de acordes da cifra nas batidas do áudio.
 
     Retorna None quando não há material suficiente. ``confidence`` mede o quanto
@@ -337,13 +480,16 @@ def align_chart_to_beats(beat_chroma: BeatChroma, chart_chords: Sequence[str],
     starts = np.asarray(sorted({int(s) for s in section_starts if 0 < int(s) < len(chords)}),
                         dtype=np.int64)
     best = None
+    novelty = _energy_novelty(np.asarray(beat_chroma.energy, dtype=np.float64), beats_per_bar)
     shifts = [0] + ([int(capo_semitones) % 12] if int(capo_semitones) % 12 else [])
     for shift in shifts:
         templates, symbols = _event_templates(chords, shift)
         similarity = np.clip(beat_chroma.chroma @ templates.T, 0.0, 1.0)
         similarity[silent] = 0.0
+        generic = _generic_similarity(beat_chroma.chroma)
         for phase in range(beats_per_bar):
-            total, path = _viterbi(similarity, silent, phase, beats_per_bar, starts)
+            total, path = _viterbi(similarity, silent, phase, beats_per_bar, starts, novelty,
+                                   generic)
             if best is None or total > best[0]:
                 best = (total, path, phase, shift, symbols, similarity)
     _, path, phase, shift, symbols, similarity = best
@@ -364,7 +510,21 @@ def align_chart_to_beats(beat_chroma: BeatChroma, chart_chords: Sequence[str],
     timeline = HarmonyTimeline(
         beat_times=beat_chroma.beat_times, chords=timeline_chords,
         event_indices=event_indices, beats_per_bar=beats_per_bar,
-        downbeat_phase=int(phase), confidence=confidence, transposition=int(shift))
+        downbeat_phase=int(phase), confidence=confidence, transposition=int(shift),
+        energy=np.asarray(beat_chroma.energy, dtype=np.float64),
+        onsets=(np.asarray(beat_chroma.onsets, dtype=np.float64)
+                if beat_chroma.onsets is not None else None),
+        tail_chroma=_transpose_chroma(beat_chroma.tail_chroma, 0),
+        low_onsets=getattr(beat_chroma, "low_onsets", None),
+        high_onsets=getattr(beat_chroma, "high_onsets", None),
+        # O "Tom:" do Cifra Club é o tom SOANTE (forma + capotraste). Se o áudio soa
+        # com o capotraste (shift == capo) o tom é o da cifra; se soa na forma escrita
+        # (shift == 0), o tom é o da forma: capo semitons abaixo.
+        key=_transpose_key(key, shift - int(capo_semitones) % 12),
+        event_keys=[_transpose_key(k, shift - int(capo_semitones) % 12) for k in event_keys],
+        event_sections=list(section_types),
+        event_section_labels=list(section_labels),
+        section_start_events=[int(s) for s in starts])
     logger.info("Cifra alinhada ao áudio: %d batidas, fase do tempo 1=%d, transposição=%+d, "
                 "confiança=%.2f", timeline.beat_count, phase, shift, confidence)
     return timeline

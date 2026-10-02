@@ -160,7 +160,10 @@ class TestAdaptiveTempo(unittest.TestCase):
         self.assertIs(ctx, session.context)
         self.assertEqual(session.clock.tracking_state, "TRACKING")
         self.assertIs(registry.bass_player, analyzer.bass_player)
-        self.assertTrue(bass.synthesizer._scheduled)
+        # Só pulsos (contagem/bateria) e silêncio: a música ainda não começou —
+        # o baixo espera o primeiro acorde da cifra.
+        self.assertFalse(session.music_started)
+        self.assertFalse(bass.synthesizer._scheduled)
 
     def test_session_reset_restores_initial_tempo_and_clears_pulse_history(self):
         session = SongSession(Song(title="Reset", chart_text="C\nG", bpm=120))

@@ -14,6 +14,7 @@ class BassPatternType(Enum):
     ROOT_FIFTH = "ROOT + FIFTH"                 # Fundamental e quinta alternadas (clássico pop/rock)
     ROOT_FIFTH_OCTAVE = "ROOT + FIFTH + OCTAVE" # Fundamental, quinta e oitava
     SUSTAINED = "SUSTAINED"                     # Fundamental sustentada ao longo do compasso/acorde
+    STYLE = "STYLE"                             # Arranjo criativo por estilo musical (BassArranger)
 
 
 class BassNoteValue(Enum):

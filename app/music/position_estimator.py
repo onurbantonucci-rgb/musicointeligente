@@ -347,6 +347,10 @@ class PositionEstimator:
         detected_symbol = parse_chord(detected_chord)
         return self._chords_equal(expected_symbol, detected_symbol) or self._roots_equal(expected_symbol, detected_symbol)
 
+    # Mínimo de um acorde da cifra (há cifras com um acorde por tempo): abaixo disso
+    # é a voz ou um ornamento confundindo o detector.
+    _MIN_EVENT_BEATS = 0.6
+
     def _consume_from_audio(self, detected_chord: str, detected_confidence: float = 0.0,
                             expected_duration_beats: float = 0.0,
                             duration_confidence: float = 0.0,
@@ -395,6 +399,11 @@ class PositionEstimator:
                     if (self._startup_lock and not self._start_anchor_confirmed and
                             self._clock.total_beats < 2.0):
                         confirmed = False
+                    # Uma "troca" logo depois de entrar no acorde costuma ser a voz
+                    # ou um ornamento confundindo o detector, não a banda mudando.
+                    if (confirmed and not recovery_confirmation and
+                            elapsed < self._MIN_EVENT_BEATS):
+                        confirmed = False
                     if confirmed:
                         self._set_chart_cursor(index, "confirmed expected next chord", absolute_beat)
                         self._global_recovery_confirmation_pending = False
@@ -427,8 +436,12 @@ class PositionEstimator:
                                     successor_confidence >= 0.35 and
                                     next_index < self._alignment.event_count and
                                     self._event_matches(next_index, successor_chord)))
+            # O acorde que está terminando precisa ter durado o mínimo de um acorde
+            # da cifra; um "acorde" de frações de tempo é a voz/ornamento.
+            lasted = min(float(getattr(event, "raw_duration_beats", self._MIN_EVENT_BEATS)),
+                         self._event_elapsed_beats(event.start_beat + event.raw_duration_beats))
             if (self._event_matches(self._chart_cursor_index, event.symbol) and
-                    successor_confirmed):
+                    successor_confirmed and lasted >= self._MIN_EVENT_BEATS):
                 self._set_chart_cursor(self._chart_cursor_index + 1,
                                        "confirmed harmonic transition", event.start_beat + event.raw_duration_beats)
                 advanced = True
@@ -524,6 +537,39 @@ class PositionEstimator:
         self._has_seen_harmonic_observation = False
         self._startup_lock = True
         self._start_anchor_confirmed = False
+
+    @property
+    def capo_semitones(self) -> int:
+        return self._capo_semitones
+
+    def relocate_to_bar(self, bar: int, reason: str, note: str = "") -> None:
+        """Reposiciona a cifra por uma evidência externa forte (ex.: a letra cantada)."""
+        position = self._alignment.get_position_at(max(1, int(bar)))
+        self._set_chart_cursor(position.element_index, reason, self._clock.total_beats, note)
+        self._bar_offset = self._clock.bar - position.current_bar
+        self._tracking_state = TrackingState.TRACKING
+        self._position_confidence = max(self._position_confidence, 0.9)
+        self._consecutive_mismatch_seconds = 0.0
+
+    def relocate_to_event(self, event_index: int, reason: str, note: str = "") -> None:
+        """Como ``relocate_to_bar``, mas por acorde da cifra (vários por compasso)."""
+        if self._alignment.event_count <= 0:
+            return
+        event_index = max(0, min(self._alignment.event_count - 1, int(event_index)))
+        position = self._alignment.get_position_for_event(event_index)
+        self._set_chart_cursor(event_index, reason, self._clock.total_beats, note)
+        self._bar_offset = self._clock.bar - position.current_bar
+        self._tracking_state = TrackingState.TRACKING
+        self._position_confidence = max(self._position_confidence, 0.85)
+        self._consecutive_mismatch_seconds = 0.0
+
+    def observe_start_chord(self, chord: str, confidence: float) -> None:
+        """Observação harmônica feita durante a confirmação do início da música.
+
+        Antes do início a cifra não se move, mas a observação ainda decide se o
+        áudio soa com ou sem o capotraste (forma escrita x som real).
+        """
+        self._resolve_capo_domain(chord, confidence)
 
     def set_capo(self, semitones: int) -> None:
         """Informa o capotraste (semitons) para comparar o áudio soante com os shapes escritos."""
@@ -681,8 +727,14 @@ class PositionEstimator:
                 )
                 if strong_enough and distance >= 1:
                     target_event = self._alignment.get_position_at(loc_bar).element_index
-                    # Saltos para trás precisam de uma progressão forte e longa.
-                    if target_event >= self._chart_cursor_index or (loc_len >= 3 and loc_score >= 0.90):
+                    # Nunca volta para "repetir" compassos perdidos: só segue para frente.
+                    # A única volta aceita é para o INÍCIO de uma seção (a banda repetindo
+                    # o refrão, por exemplo), e com uma progressão forte e longa.
+                    first_event = target_event - (loc_len - 1)
+                    backward_ok = (loc_len >= 3 and loc_score >= 0.90 and any(
+                        first_event <= start <= target_event
+                        for start in self._alignment.section_start_events()))
+                    if target_event >= self._chart_cursor_index or backward_ok:
                         self._set_chart_cursor(
                             target_event, "global progression recovery", self._clock.total_beats,
                             f"matched_events={loc_len}; confidence={loc_score:.2f}")
@@ -861,9 +913,9 @@ class PositionEstimator:
 
                     if local_match:
                         matched_bar, matched_chord = local_match
-                        # Só ajusta se estiver monotonicamente próximo (evita saltos bruscos para trás)
+                        # Só para frente: perdeu um compasso, alcança a música; não volta.
                         bar_diff = matched_bar - current_bar
-                        if -1 <= bar_diff <= 2:
+                        if 0 <= bar_diff <= 2:
                             self._tracking_state = TrackingState.RECOVERING
                             action_note = f"Recuperado na janela local (Comp. {matched_bar} - {matched_chord})"
                             self._position_confidence = min(0.88, self._position_confidence + 0.10)
@@ -883,7 +935,7 @@ class PositionEstimator:
                             start_bar_hint=current_bar,
                             window_bars=self._local_window * 2
                         )
-                        if prog and prog.confidence >= 0.75 and -1 <= (prog.end_bar - current_bar) <= 3:
+                        if prog and prog.confidence >= 0.75 and 0 <= (prog.end_bar - current_bar) <= 3:
                             self._tracking_state = TrackingState.RECOVERING
                             current_bar = prog.end_bar
                             self._set_chart_cursor(self._alignment.get_position_at(current_bar).element_index)
